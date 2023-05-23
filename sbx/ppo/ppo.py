@@ -4,11 +4,10 @@ from typing import Any, Dict, Optional, Type, TypeVar, Union
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax.training.train_state import TrainState
-from gymnasium import spaces
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import explained_variance, get_schedule_fn
+from gymnax.environments import spaces
+from sbx.common.type_aliases import GymEnv, MaybeCallback, Schedule
+from sbx.common.utils import explained_variance, get_schedule_fn
 
 from sbx.common.on_policy_algorithm import OnPolicyAlgorithmJax
 from sbx.ppo.policies import PPOPolicy
@@ -94,8 +93,10 @@ class PPO(OnPolicyAlgorithmJax):
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         target_kl: Optional[float] = None,
+        support_multi_env: bool = True,
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[Dict[str, Any]] = None,
+        env_kwargs: Optional[Dict[str, Any]] = {"num_envs": 1},
         verbose: int = 0,
         seed: Optional[int] = None,
         device: str = "auto",
@@ -114,12 +115,14 @@ class PPO(OnPolicyAlgorithmJax):
             # Note: gSDE is not properly implemented,
             use_sde=use_sde,
             sde_sample_freq=sde_sample_freq,
+            support_multi_env=support_multi_env,
             tensorboard_log=tensorboard_log,
             policy_kwargs=policy_kwargs,
+            env_kwargs=env_kwargs,
             verbose=verbose,
             device=device,
             seed=seed,
-            _init_setup_model=False,
+            _init_setup_model=_init_setup_model,
             supported_action_spaces=(
                 spaces.Box,
                 spaces.Discrete,
@@ -158,6 +161,7 @@ class PPO(OnPolicyAlgorithmJax):
         self.n_epochs = n_epochs
         self.clip_range = clip_range
         self.clip_range_vf = clip_range_vf
+        self.clip_range_schedule = get_schedule_fn(self.clip_range)
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
 
@@ -185,7 +189,7 @@ class PPO(OnPolicyAlgorithmJax):
             self.vf = self.policy.vf
 
         # Initialize schedules for policy/value clipping
-        self.clip_range_schedule = get_schedule_fn(self.clip_range)
+    #    self.clip_range_schedule = get_schedule_fn(self.clip_range)
         # if self.clip_range_vf is not None:
         #     if isinstance(self.clip_range_vf, (float, int)):
         #         assert self.clip_range_vf > 0, "`clip_range_vf` must be positive, " "pass `None` to deactivate vf clipping"
@@ -197,11 +201,11 @@ class PPO(OnPolicyAlgorithmJax):
     def _one_update(
         actor_state: TrainState,
         vf_state: TrainState,
-        observations: np.ndarray,
-        actions: np.ndarray,
-        advantages: np.ndarray,
-        returns: np.ndarray,
-        old_log_prob: np.ndarray,
+        observations: jnp.ndarray,
+        actions: jnp.ndarray,
+        advantages: jnp.ndarray,
+        returns: jnp.ndarray,
+        old_log_prob: jnp.ndarray,
         clip_range: float,
         ent_coef: float,
         vf_coef: float,
@@ -259,21 +263,22 @@ class PPO(OnPolicyAlgorithmJax):
         # train for n_epochs epochs
         for _ in range(self.n_epochs):
             # JIT only one update
-            for rollout_data in self.rollout_buffer.get(self.batch_size):  # type: ignore[attr-defined]
+            self.key, random_key = jax.random.split(self.key, 2)
+            for rollout_data in self.rollout_buffer.get(random_key,self.batch_size):  # type: ignore[attr-defined]
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to int
-                    actions = rollout_data.actions.flatten().numpy().astype(np.int32)
+                    actions = rollout_data.actions.flatten().astype(jnp.int32)
                 else:
-                    actions = rollout_data.actions.numpy()
+                    actions = rollout_data.actions
 
                 (self.policy.actor_state, self.policy.vf_state), (pg_loss, value_loss) = self._one_update(
                     actor_state=self.policy.actor_state,
                     vf_state=self.policy.vf_state,
-                    observations=rollout_data.observations.numpy(),
+                    observations=rollout_data.observations,
                     actions=actions,
-                    advantages=rollout_data.advantages.numpy(),
-                    returns=rollout_data.returns.numpy(),
-                    old_log_prob=rollout_data.old_log_prob.numpy(),
+                    advantages=rollout_data.advantages,
+                    returns=rollout_data.returns,
+                    old_log_prob=rollout_data.old_log_prob,
                     clip_range=clip_range,
                     ent_coef=self.ent_coef,
                     vf_coef=self.vf_coef,
@@ -282,8 +287,8 @@ class PPO(OnPolicyAlgorithmJax):
 
         self._n_updates += self.n_epochs
         explained_var = explained_variance(
-            self.rollout_buffer.values.flatten(),  # type: ignore[attr-defined]
-            self.rollout_buffer.returns.flatten(),  # type: ignore[attr-defined]
+            jnp.concatenate(self.rollout_buffer.values).flatten(),  # type: ignore[attr-defined]
+            jnp.concatenate(self.rollout_buffer.returns).flatten(),  # type: ignore[attr-defined]
         )
 
         # Logs

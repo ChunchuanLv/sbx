@@ -2,11 +2,11 @@
 from typing import Dict, Optional, Tuple, Union, no_type_check
 
 import jax
-import numpy as np
+import jax.numpy as jnp
 from gymnasium import spaces
 from stable_baselines3.common.policies import BasePolicy
 from stable_baselines3.common.preprocessing import is_image_space, maybe_transpose
-from stable_baselines3.common.utils import is_vectorized_observation
+from sbx.common.utils import is_vectorized_observation
 
 
 class BaseJaxPolicy(BasePolicy):
@@ -31,11 +31,11 @@ class BaseJaxPolicy(BasePolicy):
     @no_type_check
     def predict(
         self,
-        observation: Union[np.ndarray, Dict[str, np.ndarray]],
-        state: Optional[Tuple[np.ndarray, ...]] = None,
-        episode_start: Optional[np.ndarray] = None,
+        observation: Union[jnp.ndarray, Dict[str, jnp.ndarray]],
+        state: Optional[Tuple[jnp.ndarray, ...]] = None,
+        episode_start: Optional[jnp.ndarray] = None,
         deterministic: bool = False,
-    ) -> Tuple[np.ndarray, Optional[Tuple[np.ndarray, ...]]]:
+    ) -> Tuple[jnp.ndarray, Optional[Tuple[jnp.ndarray, ...]]]:
         # self.set_training_mode(False)
 
         observation, vectorized_env = self.prepare_obs(observation)
@@ -43,18 +43,18 @@ class BaseJaxPolicy(BasePolicy):
         actions = self._predict(observation, deterministic=deterministic)
 
         # Convert to numpy, and reshape to the original action shape
-        actions = np.array(actions).reshape((-1, *self.action_space.shape))
+        actions = jnp.array(actions).reshape((-1, *self.action_space.shape))
 
         if isinstance(self.action_space, spaces.Box):
             if self.squash_output:
                 # Clip due to numerical instability
-                actions = np.clip(actions, -1, 1)
+                actions = jnp.clip(actions, -1, 1)
                 # Rescale to proper domain when using squashing
                 actions = self.unscale_action(actions)
             else:
                 # Actions could be on arbitrary scale, so clip the actions to avoid
                 # out of bound error (e.g. if sampling from a Gaussian distribution)
-                actions = np.clip(actions, self.action_space.low, self.action_space.high)
+                actions = jnp.clip(actions, self.action_space.low, self.action_space.high)
 
         # Remove batch dimension if needed
         if not vectorized_env:
@@ -62,7 +62,7 @@ class BaseJaxPolicy(BasePolicy):
 
         return actions, state
 
-    def prepare_obs(self, observation: Union[np.ndarray, Dict[str, np.ndarray]]) -> Tuple[np.ndarray, bool]:
+    def prepare_obs(self, observation: Union[jnp.ndarray, Dict[str, jnp.ndarray]]) -> Tuple[jnp.ndarray, bool]:
         vectorized_env = False
         if isinstance(observation, dict):
             assert isinstance(self.observation_space, spaces.Dict)
@@ -71,7 +71,7 @@ class BaseJaxPolicy(BasePolicy):
             vectorized_env = is_vectorized_observation(observation[keys[0]], self.observation_space[keys[0]])
 
             # Add batch dim and concatenate
-            observation = np.concatenate(
+            observation = jnp.concatenate(
                 [observation[key].reshape(-1, *self.observation_space[key].shape) for key in keys],
                 axis=1,
             )
@@ -82,7 +82,7 @@ class BaseJaxPolicy(BasePolicy):
             #     if is_image_space(obs_space):
             #         obs_ = maybe_transpose(obs, obs_space)
             #     else:
-            #         obs_ = np.array(obs)
+            #         obs_ = jnp.array(obs)
             #     vectorized_env = vectorized_env or is_vectorized_observation(obs_, obs_space)
             #     # Add batch dimension if needed
             #     observation[key] = obs_.reshape((-1, *self.observation_space[key].shape))
@@ -93,15 +93,16 @@ class BaseJaxPolicy(BasePolicy):
             observation = maybe_transpose(observation, self.observation_space)
 
         else:
-            observation = np.array(observation)
+            vectorized_env = True
+            observation = observation
 
         if not isinstance(self.observation_space, spaces.Dict):
-            assert isinstance(observation, np.ndarray)
+            assert isinstance(observation, jnp.ndarray)
             vectorized_env = is_vectorized_observation(observation, self.observation_space)
             # Add batch dimension if needed
             observation = observation.reshape((-1, *self.observation_space.shape))  # type: ignore[misc]
 
-        assert isinstance(observation, np.ndarray)
+        assert isinstance(observation, jnp.ndarray)
         return observation, vectorized_env
 
     def set_training_mode(self, mode: bool) -> None:

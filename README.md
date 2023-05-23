@@ -32,13 +32,12 @@ pip install sbx-rl
 
 
 ```python
-import gymnasium as gym
+import gymnax as gym
 
-from sbx import TQC, DroQ, SAC, PPO, DQN
+from sbx import  PPO
 
-env = gym.make("Pendulum-v1")
 
-model = TQC("MlpPolicy", env, verbose=1)
+model = PPO("MlpPolicy", "Pendulum-v1",env_kwargs={"num_envs=4"}, verbose=1)
 model.learn(total_timesteps=10_000, progress_bar=True)
 
 vec_env = model.get_env()
@@ -50,6 +49,7 @@ for i in range(1000):
 
 vec_env.close()
 ```
+22 seconds in V100
 
 ## Citing the Project
 

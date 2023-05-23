@@ -9,7 +9,8 @@ import optax
 import tensorflow_probability
 from flax.linen.initializers import constant
 from flax.training.train_state import TrainState
-from gymnasium import spaces
+#from gymnasium import spaces
+import gymnax.environments.spaces as spaces
 from stable_baselines3.common.type_aliases import Schedule
 
 from sbx.common.policies import BaseJaxPolicy
@@ -116,7 +117,7 @@ class PPOPolicy(BaseJaxPolicy):
         # Initialize noise
         self.reset_noise()
 
-        obs = jnp.array([self.observation_space.sample()])
+        obs = jnp.array([self.observation_space.sample(self.noise_key)])
 
         if isinstance(self.action_space, spaces.Box):
             actor_kwargs = {

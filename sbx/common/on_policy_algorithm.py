@@ -1,23 +1,26 @@
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
-
+import sys
+import time
 import gymnasium as gym
 import jax
+import jax.numpy as jnp
 import numpy as np
-import torch as th
 from gymnasium import spaces
-from stable_baselines3.common.buffers import RolloutBuffer
+from sbx.common.buffers import RolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
-from stable_baselines3.common.policies import BasePolicy
-from stable_baselines3.common.type_aliases import GymEnv, Schedule
-from stable_baselines3.common.vec_env import VecEnv
 
+from sbx.common.utils import safe_mean
+from sbx.common.policies import BasePolicy
+from sbx.common.base_class import BaseAlgorithmJax
 from sbx.ppo.policies import Actor, Critic, PPOPolicy
 
-OnPolicyAlgorithmSelf = TypeVar("OnPolicyAlgorithmSelf", bound="OnPolicyAlgorithmJax")
+from sbx.common.type_aliases import GymEnv, Schedule, MaybeCallback
+from sbx.common.gymanax_wrapper import GymnaxToVectorGymWrapper as VecEnv
+OnPolicyAlgorithmJaxSelf = TypeVar("OnPolicyAlgorithmJaxSelf", bound="OnPolicyAlgorithmJax")
 
 
-class OnPolicyAlgorithmJax(OnPolicyAlgorithm):
+class OnPolicyAlgorithmJax(BaseAlgorithmJax):
+    rollout_buffer: RolloutBuffer
     policy: PPOPolicy  # type: ignore[assignment]
     actor: Actor
     vf: Critic
@@ -35,9 +38,11 @@ class OnPolicyAlgorithmJax(OnPolicyAlgorithm):
         max_grad_norm: float,
         use_sde: bool,
         sde_sample_freq: int,
+        support_multi_env: bool = False,
         tensorboard_log: Optional[str] = None,
         monitor_wrapper: bool = True,
         policy_kwargs: Optional[Dict[str, Any]] = None,
+        env_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
         seed: Optional[int] = None,
         device: str = "auto",
@@ -48,25 +53,28 @@ class OnPolicyAlgorithmJax(OnPolicyAlgorithm):
             policy=policy,  # type: ignore[arg-type]
             env=env,
             learning_rate=learning_rate,
-            n_steps=n_steps,
-            gamma=gamma,
-            gae_lambda=gae_lambda,
-            ent_coef=ent_coef,
-            vf_coef=vf_coef,
-            max_grad_norm=max_grad_norm,
             use_sde=use_sde,
             sde_sample_freq=sde_sample_freq,
             monitor_wrapper=monitor_wrapper,
+            support_multi_env = support_multi_env,
             policy_kwargs=policy_kwargs,
+            env_kwargs=env_kwargs,
             tensorboard_log=tensorboard_log,
             verbose=verbose,
             seed=seed,
             supported_action_spaces=supported_action_spaces,
-            _init_setup_model=_init_setup_model,
         )
+        self.n_steps = n_steps
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.ent_coef = ent_coef
+        self.vf_coef = vf_coef
+        self.max_grad_norm = max_grad_norm
         # Will be updated later
         self.key = jax.random.PRNGKey(0)
 
+        if _init_setup_model:
+            self._setup_model()
     def _get_torch_save_params(self):
         return [], []
 
@@ -135,29 +143,27 @@ class OnPolicyAlgorithmJax(OnPolicyAlgorithm):
             if not self.use_sde or isinstance(self.action_space, gym.spaces.Discrete):
                 # Always sample new stochastic action
                 self.policy.reset_noise()
+            obs_jnp, vectorized_env = self.policy.prepare_obs(self._last_obs)  # type: ignore[has-type]
+            actions, log_probs, values = self.policy.predict_all(obs_jnp, self.policy.noise_key)
 
-            obs_tensor, _ = self.policy.prepare_obs(self._last_obs)  # type: ignore[has-type]
-            actions, log_probs, values = self.policy.predict_all(obs_tensor, self.policy.noise_key)
-
-            actions = np.array(actions)
-            log_probs = np.array(log_probs)
-            values = np.array(values)
+         #   actions = jnp.array(actions)
+         #   log_probs = jnp.array(log_probs)
+        #    values = jnp.array(values)
 
             # Rescale and perform action
-            clipped_actions = actions
             # Clip the actions to avoid out of bound error
             if isinstance(self.action_space, gym.spaces.Box):
-                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+                clipped_actions = jnp.clip(actions, self.action_space.low, self.action_space.high)
+            else:
+                clipped_actions = actions
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
-
             self.num_timesteps += env.num_envs
 
             # Give access to local variables
             callback.update_locals(locals())
             if callback.on_step() is False:
                 return False
-
             self._update_info_buffer(infos)
             n_steps += 1
 
@@ -167,42 +173,93 @@ class OnPolicyAlgorithmJax(OnPolicyAlgorithm):
 
             # Handle timeout by bootstraping with value function
             # see GitHub issue #633
-            for idx, done in enumerate(dones):
-                if (
-                    done
-                    and infos[idx].get("terminal_observation") is not None
-                    and infos[idx].get("TimeLimit.truncated", False)
-                ):
-                    terminal_obs = self.policy.prepare_obs(infos[idx]["terminal_observation"])[0]
-                    terminal_value = np.array(
-                        self.vf.apply(  # type: ignore[union-attr]
-                            self.policy.vf_state.params,
-                            terminal_obs,
-                        ).flatten()
-                    )
-
-                    rewards[idx] += self.gamma * terminal_value
+            if infos.get("terminal_observation") is not None and infos.get("TimeLimit.truncated", False):
+                terminal_obs = self.policy.prepare_obs(infos["terminal_observation"])[0]
+                terminal_value = jnp.array(
+                    self.vf.apply(  # type: ignore[union-attr]
+                        self.policy.vf_state.params,
+                        terminal_obs,
+                    ).flatten()
+                )
+                rewards += self.gamma * terminal_value
 
             rollout_buffer.add(
                 self._last_obs,  # type: ignore
                 actions,
                 rewards,
                 self._last_episode_starts,  # type: ignore
-                th.as_tensor(values),
-                th.as_tensor(log_probs),
+                values,
+                log_probs,
             )
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
 
-        values = np.array(
-            self.vf.apply(  # type: ignore[union-attr]
+        values = self.vf.apply(  # type: ignore[union-attr]
                 self.policy.vf_state.params,
                 self.policy.prepare_obs(new_obs)[0],  # type: ignore[arg-type]
-            ).flatten()
-        )
+                ).flatten()
 
-        rollout_buffer.compute_returns_and_advantage(last_values=th.as_tensor(values), dones=dones)
+        rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
         callback.on_rollout_end()
 
         return True
+
+    def train(self) -> None:
+        """
+        Consume current rollout data and update policy parameters.
+        Implemented by individual algorithms.
+        """
+        raise NotImplementedError
+
+    def learn(
+        self: OnPolicyAlgorithmJaxSelf,
+        total_timesteps: int,
+        callback: MaybeCallback = None,
+        log_interval: int = 1,
+        tb_log_name: str = "OnPolicyAlgorithmJax",
+        reset_num_timesteps: bool = True,
+        progress_bar: bool = False,
+    ) -> OnPolicyAlgorithmJaxSelf:
+        iteration = 0
+
+        total_timesteps, callback = self._setup_learn(
+            total_timesteps,
+            callback,
+            reset_num_timesteps,
+            tb_log_name,
+            progress_bar,
+        )
+
+        callback.on_training_start(locals(), globals())
+
+        assert self.env is not None
+
+        while self.num_timesteps < total_timesteps:
+            continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
+
+            if continue_training is False:
+                break
+
+            iteration += 1
+            self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
+
+            # Display training infos
+            if log_interval is not None and iteration % log_interval == 0:
+                assert self.ep_info_buffer is not None
+                time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
+                fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
+                self.logger.record("time/iterations", iteration, exclude="tensorboard")
+                if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
+                    self.logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]))
+                    self.logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+                self.logger.record("time/fps", fps)
+                self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
+                self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
+                self.logger.dump(step=self.num_timesteps)
+
+            self.train()
+
+        callback.on_training_end()
+
+        return self

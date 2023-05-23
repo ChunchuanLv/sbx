@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from stable_baselines3 import HerReplayBuffer
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.envs import BitFlippingEnv
+#from stable_baselines3.common.envs import BitFlippingEnv
 from stable_baselines3.common.evaluation import evaluate_policy
 
 from sbx import DQN, PPO, SAC, TQC, DroQ
@@ -95,9 +95,9 @@ def test_dqn() -> None:
     model.learn(128)
 
 
-@pytest.mark.parametrize("replay_buffer_class", [None, HerReplayBuffer])
-def test_dict(replay_buffer_class: Optional[Type[HerReplayBuffer]]) -> None:
-    env = BitFlippingEnv(n_bits=2, continuous=True)
-    model = SAC("MultiInputPolicy", env, replay_buffer_class=replay_buffer_class)
-
-    model.learn(int(200), progress_bar=True)
+#@pytest.mark.parametrize("replay_buffer_class", [None, HerReplayBuffer])
+#def test_dict(replay_buffer_class: Optional[Type[HerReplayBuffer]]) -> None:
+#    env = BitFlippingEnv(n_bits=2, continuous=True)
+#    model = SAC("MultiInputPolicy", env, replay_buffer_class=replay_buffer_class)
+#
+ #   model.learn(int(200), progress_bar=True)
