@@ -12,7 +12,7 @@ import torch as th
 import jax.numpy as jnp
 from gymnax.environments import spaces
 
-from stable_baselines3.common import utils
+from sbx.common import utils
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, ConvertCallback, ProgressBarCallback
 from stable_baselines3.common.env_util import is_wrapped
 from stable_baselines3.common.logger import Logger

@@ -13,6 +13,7 @@ from sbx.common.type_aliases import (
     DictRolloutBufferSamples,
     ReplayBufferSamples,
     RolloutBufferSamples,
+    HierarchicalRolloutBufferSamples,
 )
 from stable_baselines3.common.utils import get_device
 from stable_baselines3.common.vec_env import VecNormalize
@@ -322,6 +323,243 @@ class ReplayBuffer(BaseBuffer):
         return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
 
 
+class HierarchicalRolloutBuffer(BaseBuffer):
+    """
+    Rollout buffer used in on-policy algorithms like A2C/PPO.
+    It corresponds to ``buffer_size`` transitions collected
+    using the current policy.
+    This experience will be discarded after the policy update.
+    In order to use PPO objective, we also store the current value of each state
+    and the log probability of each taken action.
+
+    The term rollout here refers to the model-free notion and should not
+    be used with the concept of rollout used in model-based RL or planning.
+    Hence, it is only involved in policy and value function training but not action selection.
+
+    :param buffer_size: Max number of element in the buffer
+    :param observation_space: Observation space
+    :param action_space: Action space
+    :param device: PyTorch device
+    :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
+        Equivalent to classic advantage when set to 1.
+    :param gamma: Discount factor
+    :param n_envs: Number of parallel environments
+    """
+
+    observations: List[jnp.ndarray]
+    actions:  List[jnp.ndarray]
+    rewards:  List[jnp.ndarray]
+    advantages:  List[jnp.ndarray]
+    returns:  List[jnp.ndarray]
+    episode_starts:  List[jnp.ndarray]
+    log_probs: List[ jnp.ndarray]
+    values:  List[jnp.ndarray]
+
+    options:  List[jnp.ndarray]
+    option_starts:  List[jnp.ndarray]
+    option_start_advantages:  List[jnp.ndarray]
+    option_values:  List[jnp.ndarray]
+    option_advantages:  List[jnp.ndarray]
+    total_values:  List[jnp.ndarray]
+
+    def __init__(
+        self,
+        buffer_size: int,
+        observation_space: spaces.Space,
+        action_space: spaces.Space,
+        n_options: int,
+        device: Union[th.device, str] = "auto",
+        gae_lambda: float = 1,
+        gamma: float = 0.99,
+        n_envs: int = 1,
+    ):
+        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+        self.n_options = n_options
+        self.gae_lambda = gae_lambda
+        self.gamma = gamma
+        self.generator_ready = False
+        self.reset()
+
+    def reset(self) -> None:
+        super().reset()
+        self.observations = [jnp.zeros(( self.n_envs, *self.obs_shape), dtype=jnp.float32) ] * self.buffer_size
+        self.actions = [jnp.zeros(( self.n_envs, self.action_dim), dtype=jnp.float32)] * self.buffer_size
+        self.rewards = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.returns = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.episode_starts = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.values = [jnp.zeros((self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.log_probs = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.advantages = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+
+        self.option_returns = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.option_advantages = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.option_start_advantages = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+
+        self.options = [jnp.zeros(( self.n_envs, self.n_options), dtype=jnp.float32)] * self.buffer_size
+        self.option_starts = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.option_start_log_probs = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.option_log_probs = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.option_values = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.total_values = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.generator_ready = False
+
+    def compute_returns_and_advantage(self, last_values: jnp.ndarray,last_option_values:jnp.ndarray,
+                                      last_option_start_log_prob:jnp.ndarray, dones: jnp.ndarray) -> None:
+        """
+        Post-processing step: compute the lambda-return (TD(lambda) estimate)
+        and GAE(lambda) advantage.
+
+        Uses Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
+        to compute the advantage. To obtain Monte-Carlo advantage estimate (A(s) = R - V(S))
+        where R is the sum of discounted reward with value bootstrap
+        (because we don't always have full episode), set ``gae_lambda=1.0`` during initialization.
+
+        The TD(lambda) estimator has also two special cases:
+        - TD(1) is Monte-Carlo estimate (sum of discounted rewards)
+        - TD(0) is one-step estimate with bootstrapping (r_t + gamma * v(s_{t+1}))
+
+        For more information, see discussion in https://github.com/DLR-RM/stable-baselines3/pull/375.
+
+        :param last_values: state value estimation for the last step (one for each env)
+        :param dones: if the last step was a terminal step (one bool for each env).
+        """
+        # Convert to numpy
+        last_values = last_values.flatten()
+        last_option_values = last_option_values.flatten()
+        last_option_starts_probability = jnp.exp(last_option_start_log_prob.flatten())
+
+        last_gae_lam = 0
+
+        last_total_value = last_values * last_option_starts_probability + last_option_values * (1-last_option_starts_probability)
+        gae_lambda_multiplier = (1 - self.gae_lambda ) / (1 - self.gae_lambda ** self.buffer_size)
+        gamme_lambda = self.gamma * self.gae_lambda
+        generalized_reward = 0
+        generalized_value = 0
+        for step in reversed(range(self.buffer_size)):
+            if step == self.buffer_size - 1:
+                next_non_terminal = 1.0 - dones
+                next_total_value = last_total_value 
+            else:
+                next_non_terminal = 1.0 - self.episode_starts[step + 1]
+                next_total_value = self.total_values[step + 1]
+
+            generalized_value = generalized_value * gamme_lambda + self.gamma * next_total_value * next_non_terminal
+            generalized_reward = generalized_reward * gamme_lambda + self.rewards[step] / gae_lambda_multiplier
+            generalized_returns = gae_lambda_multiplier * (generalized_reward + generalized_value)
+            
+            self.option_advantages[step] = generalized_returns - self.values[step]
+            self.option_start_advantages[step] = generalized_returns - self.values[step] 
+            self.advantages[step] = generalized_returns - self.option_values[step]
+            
+        # TD(lambda) estimator, see Github PR #375 or "Telescoping in TD(lambda)"
+        # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
+            self.returns[step] = generalized_returns
+
+    def add(
+        self,
+        obs: jnp.ndarray,
+        action: jnp.ndarray,
+        reward: jnp.ndarray,
+        episode_start: jnp.ndarray,
+        value: jnp.ndarray,
+        option:jnp.ndarray,
+        option_start:jnp.ndarray,
+        option_value:jnp.ndarray,
+        log_prob: jnp.ndarray,
+        option_log_prob: jnp.ndarray,
+        option_start_log_prob: jnp.ndarray,
+    ) -> None:
+        """
+        :param obs: Observation
+        :param action: Action
+        :param reward:
+        :param episode_start: Start of episode signal.
+        :param value: estimated value of the current state
+            following the current policy.
+        :param log_prob: log probability of the action
+            following the current policy.
+        """
+        if len(log_prob.shape) == 0:
+            # Reshape 0-d tensor to avoid error
+            log_prob = log_prob.reshape(-1, 1)
+
+        # Reshape needed when using multiple envs with discrete observations
+        # as numpy cannot broadcast (n_discrete,) to (n_discrete, 1)
+        if isinstance(self.observation_space, spaces.Discrete):
+            obs = obs.reshape((self.n_envs, *self.obs_shape))
+
+        # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
+        action = action.reshape((self.n_envs, self.action_dim))
+
+        self.observations[self.pos] = obs
+        self.actions[self.pos] = action
+        self.rewards[self.pos] = reward
+        self.episode_starts[self.pos] = episode_start
+        self.values[self.pos] = value.flatten()
+        self.option_values[self.pos] = option_value.flatten()
+        self.option_starts[self.pos] = option_start
+        option_start_prob = jnp.exp(option_start_log_prob.flatten())
+        self.total_values[self.pos] = value.flatten() * option_start_prob + option_value.flatten() * (1-option_start_prob)
+        self.log_probs[self.pos] = log_prob
+        self.option_start_log_probs[self.pos] = option_start_log_prob
+        self.option_log_probs[self.pos] = option_log_prob * option_start_prob + option_start_log_prob * (1-option_start_prob)
+        self.pos += 1
+        if self.pos == self.buffer_size:
+            self.full = True
+
+    def get(self, random_key, batch_size: Optional[int] = None) -> Generator[RolloutBufferSamples, None, None]:
+        assert self.full, ""
+        indices = jax.random.permutation(random_key,self.buffer_size * self.n_envs)
+        # Prepare the data
+        _tensor_names = [
+            "observations",
+            "actions",
+            "options",
+            "option_starts",
+            "episode_starts",
+            "log_probs",
+            "option_log_probs",
+            "option_start_log_probs",
+            "advantages",
+            "option_advantages",
+            "option_start_advantages",
+            "returns",
+        ]
+        samples = {}
+        for tensor in _tensor_names:
+            samples[tensor] = self.flatten(self.__dict__[tensor])
+        samples["last_options"] = self.flatten( [self.__dict__["options"][-1]] + self.__dict__["options"][:-1] )
+        # Return everything, don't create minibatches
+        if batch_size is None:
+            batch_size = self.buffer_size * self.n_envs
+
+        start_idx = 0
+        while start_idx < self.buffer_size * self.n_envs:
+            yield self._get_samples(indices[start_idx : start_idx + batch_size],samples)
+            start_idx += batch_size
+
+    def _get_samples(
+        self,
+        batch_inds: jnp.ndarray,
+        samples: Dict[str, jnp.ndarray],
+        env: Optional[VecNormalize] = None,
+    ) -> HierarchicalRolloutBufferSamples:  # type: ignore[signature-mismatch] #FIXME
+        data = (
+            samples["observations"][batch_inds],
+            samples["actions"][batch_inds],
+            samples["options"][batch_inds],
+            samples["option_starts"][batch_inds],
+            samples["episode_starts"][batch_inds],
+            samples["last_options"][batch_inds],
+            samples["log_probs"][batch_inds].flatten(),
+            samples["option_log_probs"][batch_inds].flatten(),
+            samples["option_start_log_probs"][batch_inds].flatten(),
+            samples["advantages"][batch_inds].flatten(),
+            samples["option_advantages"][batch_inds].flatten(),
+            samples["option_start_advantages"][batch_inds].flatten(),
+            samples["returns"][batch_inds].flatten(),
+        )
+        return HierarchicalRolloutBufferSamples(*data)
 class RolloutBuffer(BaseBuffer):
     """
     Rollout buffer used in on-policy algorithms like A2C/PPO.

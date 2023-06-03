@@ -177,7 +177,6 @@ class PPOPolicy(BaseJaxPolicy):
         Sample new weights for the exploration matrix, when using gSDE.
         """
         self.key, self.noise_key = jax.random.split(self.key, 2)
-
     def forward(self, obs: np.ndarray, deterministic: bool = False) -> np.ndarray:
         return self._predict(obs, deterministic=deterministic)
 
@@ -189,7 +188,7 @@ class PPOPolicy(BaseJaxPolicy):
             self.reset_noise()
         return BaseJaxPolicy.sample_action(self.actor_state, observation, self.noise_key)
 
-    def predict_all(self, observation: np.ndarray, key: jax.random.KeyArray) -> np.ndarray:
+    def predict_all(self, observation: jnp.ndarray, key: jax.random.KeyArray) -> jnp.ndarray:
         return self._predict_all(self.actor_state, self.vf_state, observation, key)
 
     @staticmethod

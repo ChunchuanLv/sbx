@@ -69,7 +69,7 @@ def is_image_space(
     return False
 
 
-def maybe_transpose(observation: np.ndarray, observation_space: spaces.Space) -> jnp.ndarray:
+def maybe_transpose(observation: jnp.ndarray, observation_space: spaces.Space) -> jnp.ndarray:
     """
     Handle the different cases for images as PyTorch use channel first format.
 

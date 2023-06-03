@@ -8,7 +8,6 @@ from gymnax.environments.environment import Environment, EnvParams
 from copy import deepcopy
 import chex
 import jax
-import torch as th
 class GymnaxToGymWrapper(gym.Env):
     def __init__(
         self,

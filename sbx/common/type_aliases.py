@@ -41,6 +41,21 @@ class ReplayBufferSamplesNp(NamedTuple):
     dones: jnp.ndarray
     rewards: jnp.ndarray
 
+class HierarchicalRolloutBufferSamples(NamedTuple):
+    observations: jnp.ndarray
+    actions: jnp.ndarray
+    options: jnp.ndarray
+    option_starts: jnp.ndarray
+    episode_starts: jnp.ndarray
+    last_options: jnp.ndarray
+    old_log_probs: jnp.ndarray
+    old_option_log_probs: jnp.ndarray
+    option_start_log_probs: jnp.ndarray
+    advantages: jnp.ndarray
+    option_advantages: jnp.ndarray
+    option_start_advantages: jnp.ndarray
+    returns: jnp.ndarray
+
 class RolloutBufferSamples(NamedTuple):
     observations: jnp.ndarray
     actions: jnp.ndarray
