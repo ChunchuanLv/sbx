@@ -70,7 +70,7 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
             # pytype: enable=annotation-type-mismatch
             self._last_episode_starts = jnp.ones((self.env.num_envs,), dtype=bool)
             self._last_option_starts = jnp.ones((self.env.num_envs,), dtype=bool)
-            self._last_options = jnp.zeros((self.env.num_envs,1), dtype=int)
+            self._last_options = jnp.zeros((self.env.num_envs,), dtype=int)
             # Retrieve unnormalized observation for saving into the buffer
             if self._vec_normalize_env is not None:
                 self._last_original_obs = self._vec_normalize_env.get_original_obs()
@@ -128,6 +128,7 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
         self.ent_coef = ent_coef
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
+        self.n_options = policy_kwargs["net_arch"]["n_options"]
         # Will be updated later
         self.key = jax.random.PRNGKey(0)
 
@@ -156,6 +157,7 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
             self.n_steps,
             self.observation_space,
             self.action_space,
+            self.n_options,
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
             n_envs=self.n_envs,
@@ -201,6 +203,10 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
                 # Always sample new stochastic action
                 self.policy.reset_noise()
             obs_jnp, vectorized_env = self.policy.prepare_obs(self._last_obs)  # type: ignore[has-type]
+        #    print ("obs_jnp",obs_jnp)
+        #    print ("last_options",self._last_options)
+        #    print ("last_option_starts",self._last_option_starts)
+        #    print ("noise_key", self.policy.noise_key)
             actions, options,  log_probs, option_log_probs, values, option_values = self.policy.predict_all(obs_jnp,self._last_options,self._last_option_starts,
                                                                  self.policy.noise_key)
 
@@ -214,7 +220,8 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
                 clipped_actions = jnp.clip(actions, self.action_space.low, self.action_space.high)
             else:
                 clipped_actions = actions
-
+       #     print ("clipped_actions",clipped_actions)
+         #   print ("env_state",env.env_state)
             new_obs, rewards, dones, infos = env.step(clipped_actions)
             self.num_timesteps += env.num_envs
 
@@ -258,7 +265,7 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
             self._last_options = options
-            self._last_option_starts, option_start_log_probs, option_start_logits = self.policy.option_start(new_obs, options,self.policy.noise_key)
+            self._last_option_starts, option_start_log_probs, option_start_logits = self.policy.option_start(new_obs, options,dones,self.policy.noise_key)
 
         last_values = self.policy.value_function(new_obs)
         last_option_values = self.policy.option_value_function(new_obs, options)
@@ -281,7 +288,7 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 1,
-        tb_log_name: str = "OnPolicyAlgorithmJax",
+        tb_log_name: str = "HierarchicalOnPolicyAlgorithmJax",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ) -> OnPolicyAlgorithmJaxSelf:
@@ -323,6 +330,59 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
                 self.logger.dump(step=self.num_timesteps)
 
             self.train()
+
+        callback.on_training_end()
+
+        return self
+
+
+    def unsupervised_learn(
+        self: OnPolicyAlgorithmJaxSelf,
+        total_timesteps: int,
+        callback: MaybeCallback = None,
+        log_interval: int = 1,
+        tb_log_name: str = "UnsupervisedHierachicalOnPolicyAlgorithmJax",
+        reset_num_timesteps: bool = True,
+        progress_bar: bool = False,
+    ) -> OnPolicyAlgorithmJaxSelf:
+        iteration = 0
+
+        total_timesteps, callback = self._setup_learn(
+            total_timesteps,
+            callback,
+            reset_num_timesteps,
+            tb_log_name,
+            progress_bar,
+        )
+
+        callback.on_training_start(locals(), globals())
+
+        assert self.env is not None
+
+        while self.num_timesteps < total_timesteps:
+            continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
+
+            if continue_training is False:
+                break
+
+            iteration += 1
+            self._update_current_progress_remaining(self.num_timesteps, total_timesteps)
+
+            # Display training infos
+            if log_interval is not None and iteration % log_interval == 0:
+                assert self.ep_info_buffer is not None
+                time_elapsed = max((time.time_ns() - self.start_time) / 1e9, sys.float_info.epsilon)
+                fps = int((self.num_timesteps - self._num_timesteps_at_start) / time_elapsed)
+                self.logger.record("time/iterations", iteration, exclude="tensorboard")
+                if len(self.ep_info_buffer) > 0 and len(self.ep_info_buffer[0]) > 0:
+                    self.logger.record("rollout/ep_rew_mean", safe_mean([ep_info["r"] for ep_info in self.ep_info_buffer]))
+                    self.logger.record("rollout/ep_len_mean", safe_mean([ep_info["l"] for ep_info in self.ep_info_buffer]))
+                self.logger.record("time/fps", fps)
+                self.logger.record("time/time_elapsed", int(time_elapsed), exclude="tensorboard")
+                self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
+                self.logger.dump(step=self.num_timesteps)
+
+            self.unsupervised_train()
 
         callback.on_training_end()
 

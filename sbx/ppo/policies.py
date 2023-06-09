@@ -90,16 +90,16 @@ class PPOPolicy(BaseJaxPolicy):
         super().__init__(
             observation_space,
             action_space,
-            features_extractor_class,
-            features_extractor_kwargs,
+            squash_output=True,
+            features_extractor_class=features_extractor_class,
+            features_extractor_kwargs=features_extractor_kwargs,
             optimizer_class=optimizer_class,
             optimizer_kwargs=optimizer_kwargs,
-            squash_output=True,
         )
         self.log_std_init = log_std_init
         self.activation_fn = activation_fn
         if net_arch is not None:
-            if isinstance(net_arch, list):
+            if isinstance(net_arch, list) or  isinstance(net_arch, tuple):
                 self.n_units = net_arch[0]
             else:
                 assert isinstance(net_arch, dict)

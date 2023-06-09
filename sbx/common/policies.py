@@ -27,7 +27,6 @@ class BaseJaxPolicy(BasePolicy):
         optimizer_class: Callable[..., optax.GradientTransformation] = optax.adam,
         optimizer_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        super().__init__()
 
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -311,7 +310,7 @@ class HierarchicalBaseJaxPolicy(BaseJaxPolicy):
         super().__init__(observation_space,action_space, squash_output, features_extractor_class,
                             features_extractor_kwargs, features_extractor, normalize_images, optimizer_class,
                             optimizer_kwargs)
-    def option_start(self, observations: jnp.ndarray, options: jnp.ndarray,key: jax.random.KeyArray) \
+    def option_start(self, observations: jnp.ndarray, options: jnp.ndarray,dones:jnp.ndarray,key: jax.random.KeyArray) \
             -> [jnp.ndarray,jnp.ndarray,jnp.ndarray]:
         pass
     def value_function(self, observations: jnp.ndarray) -> jnp.ndarray:
@@ -353,5 +352,5 @@ class HierarchicalBaseJaxPolicy(BaseJaxPolicy):
 
     @staticmethod
     @jax.jit
-    def select_action(actor_state, observations):
-        return actor_state.apply_fn(actor_state.params, observations).mode()
+    def select_action(actor_state, observations,options):
+        return actor_state.apply_fn(actor_state.params, observations,options).mode()
