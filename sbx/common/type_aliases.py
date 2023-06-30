@@ -41,6 +41,14 @@ class ReplayBufferSamplesNp(NamedTuple):
     dones: jnp.ndarray
     rewards: jnp.ndarray
 
+class RolloutBufferSamples(NamedTuple):
+    observations: jnp.ndarray
+    actions: jnp.ndarray
+    old_values: jnp.ndarray
+    old_log_prob: jnp.ndarray
+    advantages: jnp.ndarray
+    returns: jnp.ndarray
+
 class HierarchicalRolloutBufferSamples(NamedTuple):
     observations: jnp.ndarray
     actions: jnp.ndarray
@@ -56,7 +64,7 @@ class HierarchicalRolloutBufferSamples(NamedTuple):
     option_start_advantages: jnp.ndarray
     returns: jnp.ndarray
 
-class EmpowermentHierarchicalRolloutBufferSamples(NamedTuple):
+class UnsupervisedHierarchicalRolloutBufferSamples(NamedTuple):
     observations: jnp.ndarray
     actions: jnp.ndarray
     options: jnp.ndarray
@@ -70,18 +78,12 @@ class EmpowermentHierarchicalRolloutBufferSamples(NamedTuple):
     option_advantages: jnp.ndarray
     option_start_advantages: jnp.ndarray
     returns: jnp.ndarray
-    variational_posterior: jnp.ndarray
-    control_values: jnp.ndarray
+    variational_log_posterior: jnp.ndarray
+    control_returns: jnp.ndarray
     option_start_time: jnp.ndarray
     entropy: jnp.ndarray
-class RolloutBufferSamples(NamedTuple):
-    observations: jnp.ndarray
-    actions: jnp.ndarray
-    old_values: jnp.ndarray
-    old_log_prob: jnp.ndarray
-    advantages: jnp.ndarray
-    returns: jnp.ndarray
-
+    option_rewards: jnp.ndarray
+    option_returns: jnp.ndarray
 
 class DictRolloutBufferSamples(NamedTuple):
     observations: JnpDict

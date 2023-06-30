@@ -465,6 +465,19 @@ def polyak_update(
             target_param.data.mul_(1 - tau)
             th.add(target_param.data, param.data, alpha=tau, out=target_param.data)
 
+from gymnax.environments import spaces
+from gymnax.environments.spaces import Box, Discrete
+import jax
+def batched_sample(space:spaces,key,num_envs):
+    if isinstance(space, Box):
+        return jax.random.uniform(
+            key, shape=(num_envs,*space.shape), minval=space.low, maxval=space.high
+        ).astype(key.dtype)
+    elif isinstance(space,Discrete):
+        return jax.random.randint(
+            key, shape=(num_envs,*space.shape), minval=0, maxval=space.n
+        ).astype(space.dtype)
+    assert False, (space,"space not supported")
 
 def should_collect_more_steps(
     train_freq: TrainFreq,
@@ -492,7 +505,7 @@ def should_collect_more_steps(
             "The unit of the `train_freq` must be either TrainFrequencyUnit.STEP "
             f"or TrainFrequencyUnit.EPISODE not '{train_freq.unit}'!"
         )
-
+import stable_baselines3 as sb3
 
 def get_system_info(print_info: bool = True) -> Tuple[Dict[str, str], str]:
     """

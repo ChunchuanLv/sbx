@@ -1,12 +1,13 @@
 # import copy
 
+from functools import partial
 import jax
 import jax.numpy as jnp
 from gymnax.environments import spaces
 from stable_baselines3.common.policies import BasePolicy
 from sbx.common.preprocessing import is_image_space, maybe_transpose,preprocess_obs
 from sbx.common.utils import is_vectorized_observation
-
+from flax.training.train_state import TrainState
 import flax.linen as nn
 import optax
 from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union, no_type_check,Callable
@@ -292,8 +293,17 @@ class BaseJaxPolicy(BasePolicy):
         self.training = mode
 
 
+import tensorflow_probability
+tfp = tensorflow_probability.substrates.jax
+tfd = tfp.distributions
+
 
 class HierarchicalBaseJaxPolicy(BaseJaxPolicy):
+    actor_state: TrainState
+    value_state : TrainState
+    option_starter_state: TrainState
+    option_actor_state: TrainState
+    option_value_state : TrainState
 
     def __init__(
         self,
@@ -310,13 +320,27 @@ class HierarchicalBaseJaxPolicy(BaseJaxPolicy):
         super().__init__(observation_space,action_space, squash_output, features_extractor_class,
                             features_extractor_kwargs, features_extractor, normalize_images, optimizer_class,
                             optimizer_kwargs)
-    def option_start(self, observations: jnp.ndarray, options: jnp.ndarray,dones:jnp.ndarray,key: jax.random.KeyArray) \
-            -> [jnp.ndarray,jnp.ndarray,jnp.ndarray]:
-        pass
+    @staticmethod
+    @jax.jit
+    def total_value(option_start_times: jnp.ndarray,current_times: jnp.ndarray,option_start_log_probs: jnp.ndarray,
+                    values: jnp.ndarray,variational_posterior_probs: jnp.ndarray,
+                    option_values: jnp.ndarray,entropy: jnp.ndarray,control_values: jnp.ndarray,gamma : float):
+        option_start_probs = jnp.exp(option_start_log_probs)
+        total_values = option_start_probs * ( values + gamma ** ( option_start_times-current_times) * variational_posterior_probs ) \
+                       + (1-option_start_probs) * (option_values -entropy - (1-  gamma ** ( option_start_times-current_times) )* control_values)
+        return total_values
+    @staticmethod
+    @jax.jit
+    def _value_function(value_state, observations: jnp.ndarray) -> jnp.ndarray:
+        return value_state.apply_fn(value_state.params, observations).flatten()
     def value_function(self, observations: jnp.ndarray) -> jnp.ndarray:
-        pass
+        return self._value_function(self.value_state, observations)
+    @staticmethod
+    @jax.jit
+    def _option_value_function(option_value_state, observations: jnp.ndarray, options: jnp.ndarray) -> jnp.ndarray:
+        return option_value_state.apply_fn(option_value_state.params, observations, options).flatten()
     def option_value_function(self, observations: jnp.ndarray, options: jnp.ndarray) -> jnp.ndarray:
-        pass
+        return self._option_value_function(self.option_value_state, observations, options)
     @staticmethod
     @jax.jit
     def sample_option(option_actor_state, observations, key):
@@ -354,3 +378,198 @@ class HierarchicalBaseJaxPolicy(BaseJaxPolicy):
     @jax.jit
     def select_action(actor_state, observations,options):
         return actor_state.apply_fn(actor_state.params, observations,options).mode()
+
+    @staticmethod
+    @jax.jit
+    def _option_start(option_starter_state, observations: jnp.ndarray, options: jnp.ndarray,dones:jnp.ndarray, key: jax.random.KeyArray) \
+            -> [jnp.ndarray,jnp.ndarray,jnp.ndarray]:
+        dummy_log_prob = jnp.zeros(dones.shape, dtype=float).flatten()
+        dist = option_starter_state.apply_fn(option_starter_state.params, observations, options.flatten())
+        start = dist.sample(seed=key)
+        log_prob = dist.log_prob(start)
+        start = jnp.logical_or(dones, start.flatten())
+        log_prob = jnp.where(dones, dummy_log_prob, log_prob)
+        return start.flatten(),  log_prob.flatten()
+    def option_start(self, observations: jnp.ndarray, options: jnp.ndarray,dones:jnp.ndarray, key: jax.random.KeyArray) \
+            -> [jnp.ndarray,jnp.ndarray,jnp.ndarray]:
+        return self._option_start(self.option_starter_state, observations, options,dones, key)
+    @staticmethod
+    @jax.jit
+    def _predict_all(actor_state, value_state,option_actor_state, option_value_state,
+                     observations, option, option_start, key):
+        
+        
+        option_dist = option_actor_state.apply_fn(option_actor_state.params, observations)
+        new_option = option_dist.sample(seed=key)
+        new_option = jnp.where(option_start, new_option, option)
+        option_log_probs = option_dist.log_prob(new_option)
+
+        dist = actor_state.apply_fn(actor_state.params, observations,new_option)
+        actions = dist.sample(seed=key)
+        log_probs = dist.log_prob(actions)
+        values = value_state.apply_fn(value_state.params, observations).flatten()
+
+        option_values= option_value_state.apply_fn(option_value_state.params, observations,new_option).flatten()
+        return actions, new_option,  log_probs, option_log_probs, values, option_values
+
+    def predict_all(self, observation: jnp.ndarray, option:jnp.ndarray, option_start:jnp.ndarray, key: jax.random.KeyArray) -> Tuple[jnp.ndarray]:
+        return self._predict_all(self.actor_state, self.value_state, self.option_actor_state, self.option_value_state,
+                                 observation,  option, option_start, key)
+
+    @staticmethod
+    @partial(jax.jit, static_argnames=["deterministic"])
+    def _predict(option_starter_state, option_actor_state, actor_state,
+                 observation: jnp.ndarray,option: jnp.ndarray,episode_start: jnp.ndarray,
+                 noise_key: jax.random.KeyArray = None, deterministic: bool = False) -> [jnp.ndarray,jnp.ndarray]:  # type: ignore[override]
+        if deterministic:
+            select_new_option = HierarchicalBaseJaxPolicy.select_option_starter(option_starter_state, observation, option).flatten()
+
+            select_new_option = jnp.logical_or(select_new_option, episode_start)
+            new_option = HierarchicalBaseJaxPolicy.select_option(option_actor_state, observation).flatten()
+         #   print("new_option", new_option.shape)
+            options = jnp.where(select_new_option, new_option, option)
+        #    print("options", options.shape)
+
+            actions = HierarchicalBaseJaxPolicy.select_action(actor_state, observation, options)
+
+        else:
+            # Trick to use gSDE: repeat sampled noise by using the same noise key
+            select_new_option = HierarchicalBaseJaxPolicy.sample_option_starter(option_starter_state, observation, option,noise_key)
+
+            select_new_option = jnp.logical_or(select_new_option, episode_start)
+            new_option = HierarchicalBaseJaxPolicy.sample_option(option_actor_state, observation,noise_key)
+            options = jnp.where(select_new_option, new_option, option)
+
+            actions = HierarchicalBaseJaxPolicy.sample_action(actor_state, observation, options,noise_key)
+        return actions,options
+
+    def reset_noise(self) -> None:
+        """
+        Sample new weights for the exploration matrix, when using gSDE.
+        """
+        raise NotImplementedError
+
+    def predict(
+        self,
+        observation: Union[jnp.ndarray, Dict[str, jnp.ndarray]],
+        state: Optional[Tuple[jnp.ndarray, ...]] = None,
+        episode_start: Optional[jnp.ndarray] = None,
+        deterministic: bool = False,
+    ) -> Tuple[jnp.ndarray, Optional[Tuple[jnp.ndarray, ...]]]:
+        """
+        Get the policy action from an observation (and optional hidden state).
+        Includes sugar-coating to handle different observations (e.g. normalizing images).
+
+        :param observation: the input observation
+        :param state: The last hidden states (can be None, used in recurrent policies)
+        :param episode_start: The last masks (can be None, used in recurrent policies)
+            this correspond to beginning of episodes,
+            where the hidden states of the RNN must be reset.
+        :param deterministic: Whether or not to return deterministic actions.
+        :return: the model's action and the next hidden state
+            (used in recurrent policies)
+        """
+
+        options = state if state is not None else jnp.zeros(episode_start.shape, dtype=int)
+
+        observation, vectorized_env = self.prepare_obs(observation)
+        self.reset_noise()
+        actions, options = HierarchicalBaseJaxPolicy._predict(self.option_starter_state, self.option_actor_state, self.actor_state,
+                                        observation,options.flatten(),episode_start.flatten(),self.noise_key, deterministic)
+        if isinstance(self.action_space, spaces.Box):
+            if self.squash_output:
+                # Clip due to numerical instability
+                actions = jnp.clip(actions, -1, 1)
+                # Rescale to proper domain when using squashing
+                actions = self.unscale_action(actions)
+            else:
+                # Actions could be on arbitrary scale, so clip the actions to avoid
+                # out of bound error (e.g. if sampling from a Gaussian distribution)
+                actions = jnp.clip(actions, self.action_space.low, self.action_space.high)
+
+        # Remove batch dimension if needed
+        if not vectorized_env:
+            actions = actions.squeeze(axis=0)  # type: ignore[call-overload]
+
+        return actions, options
+
+from typing import Callable
+
+
+from flax import core
+class UnsupervisedHierarchicalBaseJaxPolicy(HierarchicalBaseJaxPolicy):
+
+
+    control_value_state : TrainState
+    option_reward_value_state : TrainState
+    variational_posterior_state : TrainState
+    #variational_posterior_apply_fn: Callable[[core.FrozenDict[str, Any], jnp.ndarray], tfd.Distribution]
+    @staticmethod
+    @jax.jit
+    def _control_value_function(control_value_state, observations: jnp.ndarray, options: jnp.ndarray) -> jnp.ndarray:
+        return control_value_state.apply_fn(control_value_state.params, observations, options).flatten()
+    def control_value_function(self, observations: jnp.ndarray, options: jnp.ndarray) -> jnp.ndarray:
+        return self._control_value_function(self.control_value_state, observations, options)
+    @staticmethod
+    @jax.jit
+    def _variational_posterior_log_prob(variational_posterior_state,observations: jnp.ndarray, options: jnp.ndarray) -> jnp.ndarray:
+        variational_posterior_dist = variational_posterior_state.apply_fn(variational_posterior_state.params, observations)
+        variational_posterior_log_probs = variational_posterior_dist.log_prob(options)
+        return variational_posterior_log_probs.flatten()
+    def variational_posterior_log_prob(self, observations: jnp.ndarray, options: jnp.ndarray) -> jnp.ndarray:
+        return self._variational_posterior_log_prob(self.variational_posterior_state, observations, options)
+    @staticmethod
+    @jax.jit
+    def _policy_entropy(option_actor_state,observations: jnp.ndarray) -> jnp.ndarray:
+
+        option_dist = option_actor_state.apply_fn(option_actor_state.params, observations)
+        entropy = option_dist.entropy()
+        return entropy
+    def policy_entropy(self,observations: jnp.ndarray) -> jnp.ndarray:
+        return self._policy_entropy(self.option_actor_state, observations)
+    @staticmethod
+    @partial(jax.jit, static_argnames=["dummy_option"])
+  #  @jax.jit
+    def _predict_all(actor_state, value_state,option_actor_state, option_value_state,option_reward_value_state,
+                     control_value_state,   variational_posterior_state,option_starter_state,
+                     observations, old_option, episode_start, key,dummy_option = True):
+        dummy_log_prob = jnp.zeros(episode_start.shape, dtype=float).flatten()
+   #     print ("observations",observations.shape)
+   #     print ("old_option",old_option.shape)
+   #     print ("episode_start",episode_start.shape)
+        option_start_dist = option_starter_state.apply_fn(option_starter_state.params, observations, old_option.flatten())
+        option_start = option_start_dist.sample(seed=key)
+        option_start_log_probs =  option_start_dist.log_prob(option_start).flatten()
+
+        option_start = jnp.logical_or(episode_start,  option_start.flatten())
+     #   print ("option_start",option_start.shape)
+    #    print ("episode_start",episode_start.shape)
+        option_start_log_probs = jnp.where(episode_start, dummy_log_prob,option_start_log_probs)
+
+
+        option_dist = option_actor_state.apply_fn(option_actor_state.params, observations,dummy_option)
+        entropy = option_dist.entropy()
+        new_option = option_dist.sample(seed=key)
+        new_option = jnp.where(option_start, new_option, old_option)
+        option_log_probs = option_dist.log_prob(new_option)
+
+        dist = actor_state.apply_fn(actor_state.params, observations,new_option)
+        actions = dist.sample(seed=key)
+        log_probs = dist.log_prob(actions)
+        values = value_state.apply_fn(value_state.params, observations).flatten()
+
+        option_values= option_value_state.apply_fn(option_value_state.params, observations,new_option).flatten()
+        last_option_values= option_value_state.apply_fn(option_value_state.params, observations,old_option).flatten()
+
+        option_reward_values = option_reward_value_state.apply_fn(option_reward_value_state.params, observations, new_option).flatten()
+        control_values = control_value_state.apply_fn(control_value_state.params, observations,new_option).flatten()
+        last_option_control_values = control_value_state.apply_fn(control_value_state.params, observations,old_option).flatten()
+        variational_posterior_dist = variational_posterior_state.apply_fn(variational_posterior_state.params, observations)
+        variational_posterior_log_probs = variational_posterior_dist.log_prob(old_option).flatten()
+        return actions,option_start, new_option,  log_probs, option_log_probs, values, option_values,\
+            last_option_values,option_reward_values, last_option_control_values,control_values,entropy, variational_posterior_log_probs,option_start_log_probs
+
+    def predict_all(self, observation: jnp.ndarray, old_option:jnp.ndarray, episode_start:jnp.ndarray, key: jax.random.KeyArray,dummy_option=True) -> Tuple[jnp.ndarray]:
+        return self._predict_all(self.actor_state, self.value_state, self.option_actor_state, self.option_value_state,self.option_reward_value_state,
+                                 self.control_value_state,self.variational_posterior_state,self.option_starter_state,
+                                 observation,  old_option, episode_start, key,dummy_option)

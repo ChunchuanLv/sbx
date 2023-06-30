@@ -52,7 +52,6 @@ def maybe_make_env(env: Union[Env, str], verbose: int,env_kwargs: Optional[Dict[
     :param verbose: Verbosity level: 0 for no output, 1 for indicating if envrironment is created
     :return A Gym (vector) environment.
     """
-
     if "num_envs" in env_kwargs:
         num_envs = env_kwargs["num_envs"]
         del env_kwargs["num_envs"]

@@ -1,21 +1,20 @@
 from typing import Any, Callable, Dict, Tuple, Optional, Union
 
-from functools import partial
 import flax.linen as nn
 import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-import tensorflow_probability
 from flax.linen.initializers import constant
 from flax.training.train_state import TrainState
-#from gymnasium import spaces
+# from gymnasium import spaces
 import gymnax.environments.spaces as spaces
 from stable_baselines3.common.type_aliases import Schedule
 
 from sbx.common.policies import HierarchicalBaseJaxPolicy
 
+import tensorflow_probability
 tfp = tensorflow_probability.substrates.jax
 tfd = tfp.distributions
 
@@ -26,29 +25,40 @@ class OptionCrtic(nn.Module):
     activation_fn: Callable = nn.tanh
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray,z:jnp.ndarray) -> jnp.ndarray:
-        z_embed = nn.Embed(self.n_options,self.n_units)(z)
-        x = nn.Dense(self.n_units)(x)+ z_embed
+    def __call__(self, x: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        z_embed = nn.Embed(self.n_options, self.n_units)(z)
+        x = nn.Dense(self.n_units)(x) + z_embed
         x = self.activation_fn(x)
         x = nn.Dense(self.n_units)(x)
         x = self.activation_fn(x)
         x = nn.Dense(1)(x)
         return x
 
+
 class OptionStarter(nn.Module):
     n_units: int = 256
     n_options: int = 16
     activation_fn: Callable = nn.tanh
 
-    @nn.compact
-    def __call__(self, x: jnp.ndarray,z:jnp.ndarray) -> tfd.Distribution:  # type: ignore[name-defined]
-        z_embed = nn.Embed(self.n_options,self.n_units)(z)
-        x = nn.Dense(self.n_units)(x)+ z_embed
+    def setup(self):
+        self.dense1  = nn.Dense(self.n_units)
+        self.dense2 = nn.Dense(self.n_units)
+        self.dense3 = nn.Dense(self.n_options)
+
+    def __call__(self, x: jnp.ndarray, z: jnp.ndarray) -> tfd.Distribution:  # type: ignore[name-defined]
+        x = self.dense1 (x)
         x = self.activation_fn(x)
-        x = nn.Dense(self.n_units)(x)
+        x = self.dense2(x)
         x = self.activation_fn(x)
-        mean = nn.Dense(1)(x)
-        return tfd.Bernoulli(logits=mean)
+        x = self.dense3(x)
+    #    x = jax.nn.log_softmax(x)
+        dist = tfd.Categorical(logits=x)
+    #    x = jax.nn.softmax(x)
+     #   mean_l = jnp.take(x,z)
+     #   logits= - jnp.log(jnp.exp(-mean_l)-1)
+     #   tfd.Bernoulli(probs=jnp.exp(dist.log_prob(z)))
+        return tfd.Bernoulli(probs=jnp.exp(dist.log_prob(z)))
+
 
 class OptionActor(nn.Module):
     n_options: int = 16
@@ -60,14 +70,18 @@ class OptionActor(nn.Module):
         return jnp.array(0.0)
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> tfd.Distribution:  # type: ignore[name-defined]
+    def __call__(self, x: jnp.ndarray,dummy_option=False) -> tfd.Distribution:  # type: ignore[name-defined]
+        if dummy_option:
+            return tfd.Categorical(logits=jnp.zeros( (x.shape[0],self.n_options)))
         x = nn.Dense(self.n_units)(x)
         x = self.activation_fn(x)
         x = nn.Dense(self.n_units)(x)
         x = self.activation_fn(x)
         mean = nn.Dense(self.n_options)(x)
+    #    if dummy_option: mean = mean * 0
         dist = tfd.Categorical(logits=mean)
         return dist
+
 
 class Critic(nn.Module):
     n_units: int = 256
@@ -82,6 +96,7 @@ class Critic(nn.Module):
         x = nn.Dense(1)(x)
         return x
 
+
 class Actor(nn.Module):
     action_dim: int
     n_options: int
@@ -95,11 +110,11 @@ class Actor(nn.Module):
         return jnp.array(0.0)
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray,z:jnp.ndarray) -> tfd.Distribution:  # type: ignore[name-defined]
-   #     print ("options",z.shape,z.dtype,z)
-  #      print ("obs",x.shape,x.dtype,x)
-        z_embed = nn.Embed(self.n_options,self.n_units)(z)
-        x = nn.Dense(self.n_units)(x)+ z_embed
+    def __call__(self, x: jnp.ndarray, z: jnp.ndarray) -> tfd.Distribution:  # type: ignore[name-defined]
+        #     print ("options",z.shape,z.dtype,z)
+        #      print ("obs",x.shape,x.dtype,x)
+        z_embed = nn.Embed(self.n_options, self.n_units)(z)
+        x = nn.Dense(self.n_units)(x) + z_embed
         x = self.activation_fn(x)
         x = nn.Dense(self.n_units)(x)
         x = self.activation_fn(x)
@@ -114,26 +129,27 @@ class Actor(nn.Module):
 
 class HPPOPolicy(HierarchicalBaseJaxPolicy):
     optimizer_class: Callable[..., optax.GradientTransformation] = optax.adam
+
     def __init__(
-        self,
-        observation_space: gym.spaces.Space,
-        action_space: gym.spaces.Space,
-        lr_schedule: Schedule,
-        net_arch: Optional[Dict[str, int]] = None,
-        ortho_init: bool = False,
-        log_std_init: float = 0.0,
-        activation_fn=nn.tanh,
-        use_sde: bool = False,
-        # Note: most gSDE parameters are not used
-        # this is to keep API consistent with SB3
-        use_expln: bool = False,
-        clip_mean: float = 2.0,
-        features_extractor_class=None,
-        features_extractor_kwargs: Optional[Dict[str, Any]] = None,
-        normalize_images: bool = True,
-        optimizer_class: Callable[..., optax.GradientTransformation] = optax.adam,
-        optimizer_kwargs: Optional[Dict[str, Any]] = None,
-        share_features_extractor: bool = False,
+            self,
+            observation_space: gym.spaces.Space,
+            action_space: gym.spaces.Space,
+            lr_schedule: Schedule,
+            net_arch: Optional[Dict[str, int]] = None,
+            ortho_init: bool = False,
+            log_std_init: float = 0.0,
+            activation_fn=nn.tanh,
+            use_sde: bool = False,
+            # Note: most gSDE parameters are not used
+            # this is to keep API consistent with SB3
+            use_expln: bool = False,
+            clip_mean: float = 2.0,
+            features_extractor_class=None,
+            features_extractor_kwargs: Optional[Dict[str, Any]] = None,
+            normalize_images: bool = True,
+            optimizer_class: Callable[..., optax.GradientTransformation] = optax.adam,
+            optimizer_kwargs: Optional[Dict[str, Any]] = None,
+            share_features_extractor: bool = False,
     ):
         if optimizer_kwargs is None:
             # Small values to avoid NaN in Adam optimizer
@@ -163,7 +179,7 @@ class HPPOPolicy(HierarchicalBaseJaxPolicy):
         self.key = self.noise_key = jax.random.PRNGKey(0)
 
     def build(self, key: jax.random.KeyArray, lr_schedule: Schedule, max_grad_norm: float) -> jax.random.KeyArray:
-        key, actor_key, value_key, option_key,option_starter_key, option_value_key = jax.random.split(key, 6)
+        key, actor_key, value_key, option_key, option_starter_key, option_value_key = jax.random.split(key, 6)
         # Keep a key for the actor
         key, self.key = jax.random.split(key, 2)
         # Initialize noise
@@ -202,7 +218,7 @@ class HPPOPolicy(HierarchicalBaseJaxPolicy):
                 ),
             ),
         )
-        
+
         self.option_starter = OptionStarter(
             n_options=self.n_options,
             n_units=self.n_units,
@@ -211,7 +227,7 @@ class HPPOPolicy(HierarchicalBaseJaxPolicy):
         self.option_starter.reset_noise = self.reset_noise
         self.option_starter_state = TrainState.create(
             apply_fn=self.option_starter.apply,
-            params=self.option_starter.init(option_starter_key, obs,opts),
+            params=self.option_starter.init(option_starter_key, obs, opts),
             tx=optax.chain(
                 optax.clip_by_global_norm(max_grad_norm),
                 self.optimizer_class(
@@ -220,7 +236,7 @@ class HPPOPolicy(HierarchicalBaseJaxPolicy):
                 ),
             ),
         )
-        
+
         self.option_value = OptionCrtic(
             n_options=self.n_options,
             n_units=self.n_units,
@@ -228,7 +244,7 @@ class HPPOPolicy(HierarchicalBaseJaxPolicy):
         )
         self.option_value_state = TrainState.create(
             apply_fn=self.option_value.apply,
-            params=self.option_value.init(option_value_key, obs,opts),
+            params=self.option_value.init(option_value_key, obs, opts),
             tx=optax.chain(
                 optax.clip_by_global_norm(max_grad_norm),
                 self.optimizer_class(
@@ -237,7 +253,7 @@ class HPPOPolicy(HierarchicalBaseJaxPolicy):
                 ),
             ),
         )
-        
+
         self.actor = Actor(
             n_options=self.n_options,
             n_units=self.n_units,
@@ -250,7 +266,7 @@ class HPPOPolicy(HierarchicalBaseJaxPolicy):
 
         self.actor_state = TrainState.create(
             apply_fn=self.actor.apply,
-            params=self.actor.init(actor_key, obs,opts),
+            params=self.actor.init(actor_key, obs, opts),
             tx=optax.chain(
                 optax.clip_by_global_norm(max_grad_norm),
                 self.optimizer_class(
@@ -278,163 +294,12 @@ class HPPOPolicy(HierarchicalBaseJaxPolicy):
         self.value.apply = jax.jit(self.value.apply)  # type: ignore[method-assign]
         self.option_value.apply = jax.jit(self.option_value.apply)  # type: ignore[method-assign]
         self.option_starter.apply = jax.jit(self.option_starter.apply)  # type: ignore[method-assign]
-        self.option_actor.apply = jax.jit(self.option_actor.apply)  # type: ignore[method-assign]
+        self.option_actor.apply = jax.jit(self.option_actor.apply,static_argnames=["dummy_option"])  # type: ignore[method-assign]
 
         return key
-    def _sample_new_options(self, observations: jnp.ndarray,options: jnp.ndarray, key: jax.random.KeyArray) -> jnp.ndarray:
-        return self.option_actor_state.apply_fn(self.option_actor_state.params, observations,options).sample(seed=key).flatten()
-    @staticmethod
-    @jax.jit
-    def _option_start(option_starter_state, observations: jnp.ndarray, options: jnp.ndarray,dones:jnp.ndarray, key: jax.random.KeyArray) \
-            -> [jnp.ndarray,jnp.ndarray,jnp.ndarray]:
-        dummy_log_prob =  jnp.zeros(dones.shape, dtype=float).flatten()
-        dummy_start =  dones.flatten()
-       # print ("observations",observations.shape)
-      #  print ("options",options.shape)
-        dist = option_starter_state.apply_fn(option_starter_state.params, observations, options.flatten())
-    #    print ("dist",dist)
-        start = dist.sample(seed=key).flatten()
 
-        start = jnp.where(dones, dummy_start, start)
-        log_prob = jnp.where(dones, dummy_log_prob, dist.log_prob(start.reshape(-1,1)).flatten())
-        return start.flatten(),  log_prob.flatten(), dist.logits.flatten()
-    def option_start(self, observations: jnp.ndarray, options: jnp.ndarray,dones:jnp.ndarray, key: jax.random.KeyArray) \
-            -> [jnp.ndarray,jnp.ndarray,jnp.ndarray]:
-    #   print ("observations",observations.shape)
-   #    print ("options",options.shape)
-    #    print ("dones",dones.shape)
-    #    print("key",key)
-        return self._option_start(self.option_starter_state, observations, options,dones, key)
-    @staticmethod
-    @jax.jit
-    def _value_function(value_state, observations: jnp.ndarray) -> jnp.ndarray:
-        return value_state.apply_fn(value_state.params, observations).flatten()
-    def value_function(self, observations: jnp.ndarray) -> jnp.ndarray:
-        return self._value_function(self.value_state, observations)
-    @staticmethod
-    @jax.jit
-    def _option_value_function(option_value_state, observations: jnp.ndarray, options: jnp.ndarray) -> jnp.ndarray:
-        return option_value_state.apply_fn(option_value_state.params, observations, options).flatten()
-    def option_value_function(self, observations: jnp.ndarray, options: jnp.ndarray) -> jnp.ndarray:
-        return self._option_value_function(self.option_value_state, observations, options)
-    def reset_noise(self, batch_size: int = 1) -> None:
+    def reset_noise(self) -> None:
         """
         Sample new weights for the exploration matrix, when using gSDE.
         """
         self.key, self.noise_key = jax.random.split(self.key, 2)
-
-    def forward(self, obs: jnp.ndarray, deterministic: bool = False) -> jnp.ndarray:
-        return self._predict(obs, deterministic=deterministic)
-
-
-#actions, options,  log_probs, option_log_probs, values, option_values
-
-    def predict_all(self, observation: jnp.ndarray, option:jnp.ndarray, option_start:jnp.ndarray, key: jax.random.KeyArray) -> Tuple[jnp.ndarray]:
-    #    print ("observation", observation.shape)
-    #    print ("option", option.shape)
-    #    print ("option_start", option_start.shape)
-    #    print ("key", key)
-        return self._predict_all(self.actor_state, self.value_state, self.option_actor_state, self.option_value_state,
-                                 observation,  option, option_start, key)
-
-    @staticmethod
-    @jax.jit
-    def _predict_all(actor_state, value_state,option_actor_state, option_value_state,
-                     obervations, option, option_start, key):
-
-        option_dist = option_actor_state.apply_fn(option_actor_state.params, obervations)
-        new_option = option_dist.sample(seed=key)
-        new_option = jnp.where(option_start, new_option, option)
-        option_log_probs = option_dist.log_prob(new_option)
-
-        dist = actor_state.apply_fn(actor_state.params, obervations,new_option)
-        actions = dist.sample(seed=key)
-        log_probs = dist.log_prob(actions)
-        values = value_state.apply_fn(value_state.params, obervations).flatten()
-
-
-        option_values= option_value_state.apply_fn(option_value_state.params, obervations,new_option).flatten()
-        return actions, new_option,  log_probs, option_log_probs, values, option_values
-
-    @staticmethod
-    @partial(jax.jit, static_argnames=["deterministic"])
-    def _predict(option_starter_state, option_actor_state, actor_state,
-                 observation: jnp.ndarray,option: jnp.ndarray,episode_start: jnp.ndarray,
-                 noise_key: jax.random.KeyArray = None, deterministic: bool = False) -> [jnp.ndarray,jnp.ndarray]:  # type: ignore[override]
-     #   print ("option_starter_state",option_starter_state)
-      #  print ("option_actor_state",option_actor_state)
-       # print ("actor_state",actor_state)
-       # print ("observation",observation)
-       # print ("option",option)
-       # print ("episode_start",episode_start)
-       # print ("noise_key",noise_key)
-       # print ("deterministic",deterministic)
-        if deterministic:
-            select_new_option = HierarchicalBaseJaxPolicy.select_option_starter(option_starter_state, observation, option).flatten()
-
-            select_new_option = jnp.logical_or(select_new_option, episode_start)
-            new_option = HierarchicalBaseJaxPolicy.select_option(option_actor_state, observation).flatten()
-         #   print("new_option", new_option.shape)
-            options = jnp.where(select_new_option, new_option, option)
-        #    print("options", options.shape)
-
-            actions = HierarchicalBaseJaxPolicy.select_action(actor_state, observation, options)
-
-        else:
-            # Trick to use gSDE: repeat sampled noise by using the same noise key
-            select_new_option = HierarchicalBaseJaxPolicy.sample_option_starter(option_starter_state, observation, option,noise_key)
-
-            select_new_option = jnp.logical_or(select_new_option, episode_start)
-            new_option = HierarchicalBaseJaxPolicy.sample_option(option_actor_state, observation,noise_key)
-            options = jnp.where(select_new_option, new_option, option)
-
-            actions = HierarchicalBaseJaxPolicy.sample_action(actor_state, observation, options,noise_key)
-        return actions,options
-
-    def predict(
-        self,
-        observation: Union[jnp.ndarray, Dict[str, jnp.ndarray]],
-        state: Optional[Tuple[jnp.ndarray, ...]] = None,
-        episode_start: Optional[jnp.ndarray] = None,
-        deterministic: bool = False,
-    ) -> Tuple[jnp.ndarray, Optional[Tuple[jnp.ndarray, ...]]]:
-        """
-        Get the policy action from an observation (and optional hidden state).
-        Includes sugar-coating to handle different observations (e.g. normalizing images).
-
-        :param observation: the input observation
-        :param state: The last hidden states (can be None, used in recurrent policies)
-        :param episode_start: The last masks (can be None, used in recurrent policies)
-            this correspond to beginning of episodes,
-            where the hidden states of the RNN must be reset.
-        :param deterministic: Whether or not to return deterministic actions.
-        :return: the model's action and the next hidden state
-            (used in recurrent policies)
-        """
-
-        options = state if state is not None else jnp.zeros(episode_start.shape, dtype=int)
-
-        observation, vectorized_env = self.prepare_obs(observation)
-  #      print ("observation",observation.shape)
-  #      print ("options",options.shape)
-        self.reset_noise()
-        actions, options = HPPOPolicy._predict(self.option_starter_state, self.option_actor_state, self.actor_state,
-                                        observation,options.flatten(),episode_start.flatten(),self.noise_key, deterministic)
-  #      print ("out options",options.shape)
-   #     print ("out actions",actions.shape)
-        if isinstance(self.action_space, spaces.Box):
-            if self.squash_output:
-                # Clip due to numerical instability
-                actions = jnp.clip(actions, -1, 1)
-                # Rescale to proper domain when using squashing
-                actions = self.unscale_action(actions)
-            else:
-                # Actions could be on arbitrary scale, so clip the actions to avoid
-                # out of bound error (e.g. if sampling from a Gaussian distribution)
-                actions = jnp.clip(actions, self.action_space.low, self.action_space.high)
-
-        # Remove batch dimension if needed
-        if not vectorized_env:
-            actions = actions.squeeze(axis=0)  # type: ignore[call-overload]
-
-        return actions, options

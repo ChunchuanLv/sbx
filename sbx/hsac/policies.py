@@ -18,13 +18,31 @@ tfp = tensorflow_probability.substrates.jax
 tfd = tfp.distributions
 
 
+class OptionCritic(nn.Module):
+    net_arch: Sequence[int]
+    use_layer_norm: bool = False
+    dropout_rate: Optional[float] = None
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, option:jnp.ndarray) -> jnp.ndarray:
+        option_embed = nn.Embed(self.n_options, self.net_arch[0])(option)
+        x = jnp.concatenate([x, option_embed], -1)
+        for n_units in self.net_arch:
+            x = nn.Dense(n_units)(x)
+            if self.dropout_rate is not None and self.dropout_rate > 0:
+                x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=False)
+            if self.use_layer_norm:
+                x = nn.LayerNorm()(x)
+            x = nn.relu(x)
+        x = nn.Dense(1)(x)
+        return x
 class Critic(nn.Module):
     net_arch: Sequence[int]
     use_layer_norm: bool = False
     dropout_rate: Optional[float] = None
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, action: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray,  action: jnp.ndarray) -> jnp.ndarray:
         x = jnp.concatenate([x, action], -1)
         for n_units in self.net_arch:
             x = nn.Dense(n_units)(x)
@@ -62,12 +80,45 @@ class VectorCritic(nn.Module):
         )(obs, action)
         return q_values
 
-
-class Actor(nn.Module):
+class PreviousOptionPredicator(nn.Module):
     net_arch: Sequence[int]
-    action_dim: int
-    log_std_min: float = -20
-    log_std_max: float = 2
+    n_options: int = 16
+
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, z: jnp.ndarray) -> tfd.Distribution:  # type: ignore[name-defined]
+        for n_units in self.net_arch:
+            x = nn.Dense(n_units)(x)
+            x = nn.relu(x)
+    #    x = jax.nn.log_softmax(x)
+        x = nn.Dense(self.n_options)(x)
+        dist = tfd.Categorical(logits=x)
+    #    x = jax.nn.softmax(x)
+     #   mean_l = jnp.take(x,z)
+     #   logits= - jnp.log(jnp.exp(-mean_l)-1)
+     #   tfd.Bernoulli(probs=jnp.exp(dist.log_prob(z)))
+        return dist
+class OptionStarter(nn.Module):
+    net_arch: Sequence[int]
+    n_options: int = 16
+
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, z: jnp.ndarray) -> tfd.Distribution:  # type: ignore[name-defined]
+        for n_units in self.net_arch:
+            x = nn.Dense(n_units)(x)
+            x = nn.relu(x)
+    #    x = jax.nn.log_softmax(x)
+        x = nn.Dense(self.n_options)(x)
+        dist = tfd.Categorical(logits=x)
+    #    x = jax.nn.softmax(x)
+     #   mean_l = jnp.take(x,z)
+     #   logits= - jnp.log(jnp.exp(-mean_l)-1)
+     #   tfd.Bernoulli(probs=jnp.exp(dist.log_prob(z)))
+        return tfd.Bernoulli(probs=jnp.exp(dist.log_prob(z)))
+class OptionActor(nn.Module):
+    net_arch: Sequence[int]
+    n_options: int
 
     def get_std(self):
         # Make it work with gSDE
@@ -76,6 +127,29 @@ class Actor(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> tfd.Distribution:  # type: ignore[name-defined]
         for n_units in self.net_arch:
+            x = nn.Dense(n_units)(x)
+            x = nn.relu(x)
+        mean = nn.Dense(self.n_options)(x)
+        dist = tfd.Categorical(logits=mean)
+        return dist
+
+class Actor(nn.Module):
+    net_arch: Sequence[int]
+    action_dim: int
+    n_options: int
+    log_std_min: float = -20
+    log_std_max: float = 2
+
+    def get_std(self):
+        # Make it work with gSDE
+        return jnp.array(0.0)
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray,z:jnp.ndarray) -> tfd.Distribution:  # type: ignore[name-defined]
+        z_embed = nn.Embed(self.n_options, self.net_arch[0])(z)
+        x = nn.Dense(self.net_arch[0])(x) + z_embed
+        x = nn.relu(x)
+        for n_units in self.net_arch[1:]:
             x = nn.Dense(n_units)(x)
             x = nn.relu(x)
         mean = nn.Dense(self.action_dim)(x)
@@ -87,7 +161,7 @@ class Actor(nn.Module):
         return dist
 
 
-class SACPolicy(BaseJaxPolicy):
+class HSACPolicy(BaseJaxPolicy):
     action_space: spaces.Box  # type: ignore[assignment]
 
     def __init__(

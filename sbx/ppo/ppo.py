@@ -120,7 +120,6 @@ class PPO(OnPolicyAlgorithmJax):
             policy_kwargs=policy_kwargs,
             env_kwargs=env_kwargs,
             verbose=verbose,
-            device=device,
             seed=seed,
             _init_setup_model=_init_setup_model,
             supported_action_spaces=(

@@ -6,11 +6,12 @@ import jax
 import jax.numpy as jnp
 from flax.training.train_state import TrainState
 from gymnax.environments import spaces
-from sbx.common.type_aliases import GymEnv, MaybeCallback, Schedule
+from sbx.common.type_aliases import GymEnv, MaybeCallback, Schedule,HierarchicalRolloutBufferSamples
 from sbx.common.utils import explained_variance, get_schedule_fn
 
 from sbx.common.hierarchical_on_policy_algorithm import HierarchicalOnPolicyAlgorithmJax
-from sbx.hppo.policies import OptionActor, OptionStarter, Actor, Critic, HPPOPolicy
+from sbx.common.buffers import HierarchicalRolloutBuffer
+from sbx.hppo.policies import HPPOPolicy
 HPPOSelf = TypeVar("HPPOSelf", bound="HPPO")
 
 
@@ -72,6 +73,8 @@ class HPPO(HierarchicalOnPolicyAlgorithmJax):
         # "MultiInputPolicy": MultiInputActorCriticPolicy,
     }
     policy: HPPOPolicy  # type: ignore[assignment]
+    rollout_buffer: HierarchicalRolloutBuffer
+
 
     def __init__(
         self,
@@ -98,7 +101,6 @@ class HPPO(HierarchicalOnPolicyAlgorithmJax):
         env_kwargs: Optional[Dict[str, Any]] = {"num_envs": 1},
         verbose: int = 0,
         seed: Optional[int] = None,
-        device: str = "auto",
         _init_setup_model: bool = True,
     ):
         super().__init__(
@@ -119,7 +121,6 @@ class HPPO(HierarchicalOnPolicyAlgorithmJax):
             policy_kwargs=policy_kwargs,
             env_kwargs=env_kwargs,
             verbose=verbose,
-            device=device,
             seed=seed,
             _init_setup_model=_init_setup_model,
             supported_action_spaces=(
@@ -319,132 +320,6 @@ class HPPO(HierarchicalOnPolicyAlgorithmJax):
         return (actor_state, option_actor_state, option_starter_state,value_state,option_value_state), \
                (pg_loss_value, option_loss_value, option_start_loss_value,vf_loss_value,option_loss_value)
 
-    @staticmethod
-    @partial(jax.jit, static_argnames=["normalize_advantage"])
-    def _unsupervised_one_update(
-        actor_state: TrainState,
-        option_actor_state: TrainState,
-        option_starter_state: TrainState,
-        value_state: TrainState,
-        option_value_state: TrainState,
-        observations: jnp.ndarray,
-        actions: jnp.ndarray,
-        options: jnp.ndarray,
-        option_starts: jnp.ndarray,
-        episode_starts: jnp.ndarray,
-        last_options: jnp.ndarray,
-        advantages: jnp.ndarray,
-        option_advantages: jnp.ndarray,
-        option_start_advantages: jnp.ndarray,
-        returns: jnp.ndarray,
-        old_log_probs: jnp.ndarray,
-        old_option_log_probs: jnp.ndarray,
-        old_option_start_log_probs: jnp.ndarray,
-        clip_range: float,
-        ent_coef: float,
-        vf_coef: float,
-        normalize_advantage: bool = True,
-    ):
-        # Normalize advantage
-        # Normalization does not make sense if mini batchsize == 1, see GH issue #325
-        if normalize_advantage and len(advantages) > 1:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-            option_advantages = (option_advantages - option_advantages.mean()) / (option_advantages.std() + 1e-8)
-            option_start_advantages = (option_start_advantages - option_start_advantages.mean()) / (option_start_advantages.std() + 1e-8)
-
-        def option_actor_loss(params):
-            dist = option_actor_state.apply_fn(params, observations)
-            option_log_probs = dist.log_prob(options)
-            entropy = dist.entropy()
-
-            old_option_log_prob = jnp.where( option_starts,  old_option_log_probs,  old_option_start_log_probs)
-            # ratio between old and new policy, should be one at the first iteration
-            ratio = jnp.exp(option_log_probs - old_option_log_prob)
-            # clipped surrogate loss
-            policy_loss_1 = option_advantages * ratio
-            policy_loss_2 = option_advantages * jnp.clip(ratio, 1 - clip_range, 1 + clip_range)
-            policy_loss = -jnp.minimum(policy_loss_1, policy_loss_2).mean()
-
-            # Entropy loss favor exploration
-            # Approximate entropy when no analytical form
-            # entropy_loss = -jnp.mean(-log_prob)
-            # analytical form
-            entropy_loss = -jnp.mean(entropy)
-
-            total_option_policy_loss = policy_loss + ent_coef * entropy_loss
-            return total_option_policy_loss
-
-        def option_start_loss(params):
-            dist = option_starter_state.apply_fn(params, observations,last_options)
-            option_start_log_probs = dist.log_prob(option_starts)
-            entropy = dist.entropy()
-
-            # ratio between old and new policy, should be one at the first iteration
-            ratio = jnp.exp(option_start_log_probs - old_option_start_log_probs)
-            # clipped surrogate loss
-            true_option_start_advantages = option_start_advantages * (1-episode_starts)
-            policy_loss_1 = true_option_start_advantages * ratio
-            policy_loss_2 = true_option_start_advantages * jnp.clip(ratio, 1 - clip_range, 1 + clip_range)
-            policy_loss = -jnp.minimum(policy_loss_1, policy_loss_2).mean()
-
-            # Entropy loss favor exploration
-            # Approximate entropy when no analytical form
-            # entropy_loss = -jnp.mean(-log_prob)
-            # analytical form
-            entropy_loss = -jnp.mean(entropy)
-
-            total_policy_loss = policy_loss + ent_coef * entropy_loss
-            return total_policy_loss
-
-        def actor_loss(params):
-            dist = actor_state.apply_fn(params, observations,options)
-            log_prob = dist.log_prob(actions)
-            entropy = dist.entropy()
-
-            # ratio between old and new policy, should be one at the first iteration
-            ratio = jnp.exp(log_prob - old_log_probs)
-            # clipped surrogate loss
-            policy_loss_1 = advantages * ratio
-            policy_loss_2 = advantages * jnp.clip(ratio, 1 - clip_range, 1 + clip_range)
-            policy_loss = -jnp.minimum(policy_loss_1, policy_loss_2).mean()
-
-            # Entropy loss favor exploration
-            # Approximate entropy when no analytical form
-            # entropy_loss = -jnp.mean(-log_prob)
-            # analytical form
-            entropy_loss = -jnp.mean(entropy)
-
-            total_policy_loss = policy_loss + ent_coef * entropy_loss
-            return total_policy_loss
-
-        pg_loss_value, grads = jax.value_and_grad(actor_loss, has_aux=False)(actor_state.params)
-        actor_state = actor_state.apply_gradients(grads=grads)
-
-        option_loss_value, grads = jax.value_and_grad(option_actor_loss, has_aux=False)(option_actor_state.params)
-        option_actor_state = option_actor_state.apply_gradients(grads=grads)
-
-        option_start_loss_value, grads = jax.value_and_grad(option_start_loss, has_aux=False)(option_starter_state.params)
-        option_starter_state = option_starter_state.apply_gradients(grads=grads)
-
-        def critic_loss(params):
-            # Value loss using the TD(gae_lambda) target
-            vf_values = value_state.apply_fn(params, observations).flatten()
-            return ((returns - vf_values) ** 2).mean()
-
-        def option_critic_loss(params):
-            # Value loss using the TD(gae_lambda) target
-            option_values = option_value_state.apply_fn(params, observations,options).flatten()
-            return ((returns - option_values) ** 2).mean()
-        vf_loss_value, grads = jax.value_and_grad(critic_loss, has_aux=False)(value_state.params)
-        value_state = value_state.apply_gradients(grads=grads)
-
-        option_loss_value, grads = jax.value_and_grad(option_critic_loss, has_aux=False)(option_value_state.params)
-        option_value_state = option_value_state.apply_gradients(grads=grads)
-
-        # loss = policy_loss + ent_coef * entropy_loss + vf_coef * value_loss
-        return (actor_state, option_actor_state, option_starter_state,value_state,option_value_state), \
-               (pg_loss_value, option_loss_value, option_start_loss_value,vf_loss_value,option_loss_value)
-
     def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.
@@ -458,6 +333,7 @@ class HPPO(HierarchicalOnPolicyAlgorithmJax):
         for _ in range(self.n_epochs):
             # JIT only one update
             self.key, random_key = jax.random.split(self.key, 2)
+            rollout_data: HierarchicalRolloutBufferSamples
             for rollout_data in self.rollout_buffer.get(random_key,self.batch_size):  # type: ignore[attr-defined]
                 if isinstance(self.action_space, spaces.Discrete):
                     # Convert discrete action from float to int
@@ -468,15 +344,15 @@ class HPPO(HierarchicalOnPolicyAlgorithmJax):
                   self.policy.value_state,self.policy.option_value_state ), \
                 (pg_loss_value, option_loss_value, option_start_loss_value,vf_loss_value,option_loss_value) = self._one_update(
                     actor_state=self.policy.actor_state,
-                option_actor_state = self.policy.option_actor_state,
-                option_starter_state= self.policy.option_starter_state,
-                value_state=self.policy.value_state,
-                option_value_state=self.policy.option_value_state,
+                    option_actor_state = self.policy.option_actor_state,
+                    option_starter_state= self.policy.option_starter_state,
+                    value_state=self.policy.value_state,
+                    option_value_state=self.policy.option_value_state,
                     observations=rollout_data.observations,
                     actions=actions,
-                options= rollout_data.options,
-                option_starts= rollout_data.option_starts,
-                episode_starts=rollout_data.episode_starts,
+                    options= rollout_data.options,
+                    option_starts= rollout_data.option_starts,
+                    episode_starts=rollout_data.episode_starts,
                     last_options=rollout_data.last_options,
                     advantages=rollout_data.advantages,
                     option_advantages=rollout_data.option_advantages,
@@ -493,19 +369,28 @@ class HPPO(HierarchicalOnPolicyAlgorithmJax):
 
         self._n_updates += self.n_epochs
         explained_var = explained_variance(
+            jnp.concatenate(self.rollout_buffer.values).flatten(),  # type: ignore[attr-defined]
+            jnp.concatenate(self.rollout_buffer.returns).flatten(),  # type: ignore[attr-defined]
+        )
+        option_explained_var = explained_variance(
             jnp.concatenate(self.rollout_buffer.option_values).flatten(),  # type: ignore[attr-defined]
             jnp.concatenate(self.rollout_buffer.returns).flatten(),  # type: ignore[attr-defined]
         )
 
+      #  episode_rewards = self.rollout_buffer.returns[self.rollout_buffer.episode_starts]
         # Logs
         # self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         # self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         # TODO: use mean instead of one point
-        self.logger.record("train/value_loss", vf_loss_value.item())
+        self.logger.record("train/action_value_loss", vf_loss_value.item())
+        self.logger.record("train/option_value_loss", option_loss_value.item())
         # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
-        # self.logger.record("train/clip_fraction", np.mean(clip_fractions))
-        self.logger.record("train/pg_loss", pg_loss_value.item())
+      #  self.logger.record("train/returns", jnp.mean(self.rollout_buffer.returns))
+        self.logger.record("train/option_loss", option_loss_value.item())
+        self.logger.record("train/action_gradient_loss", pg_loss_value.item())
+        self.logger.record("train/option_start_loss", option_start_loss_value.item())
         self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/option_explained_var", option_explained_var)
         # if hasattr(self.policy, "log_std"):
         #     self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
@@ -531,73 +416,3 @@ class HPPO(HierarchicalOnPolicyAlgorithmJax):
             reset_num_timesteps=reset_num_timesteps,
             progress_bar=progress_bar,
         )
-
-
-    def unsupervised_train(self) -> None:
-        """
-        Update policy using the currently gathered rollout buffer.
-        """
-        # Update optimizer learning rate
-        # self._update_learning_rate(self.policy.optimizer)
-        # Compute current clip range
-        clip_range = self.clip_range_schedule(self._current_progress_remaining)
-
-        # train for n_epochs epochs
-        for _ in range(self.n_epochs):
-            # JIT only one update
-            self.key, random_key = jax.random.split(self.key, 2)
-            for rollout_data in self.rollout_buffer.get(random_key,self.batch_size):  # type: ignore[attr-defined]
-                if isinstance(self.action_space, spaces.Discrete):
-                    # Convert discrete action from float to int
-                    actions = rollout_data.actions.flatten().astype(jnp.int32)
-                else:
-                    actions = rollout_data.actions
-                (self.policy.actor_state, self.policy.option_actor_state,self.policy.option_starter_state,
-                  self.policy.value_state,self.policy.option_value_state ), \
-                (pg_loss_value, option_loss_value, option_start_loss_value,vf_loss_value,option_loss_value) = self._one_update(
-                    actor_state=self.policy.actor_state,
-                option_actor_state = self.policy.option_actor_state,
-                option_starter_state= self.policy.option_starter_state,
-                value_state=self.policy.value_state,
-                option_value_state=self.policy.option_value_state,
-                    observations=rollout_data.observations,
-                    actions=actions,
-                options= rollout_data.options,
-                option_starts= rollout_data.option_starts,
-                episode_starts=rollout_data.episode_starts,
-                    last_options=rollout_data.last_options,
-                    advantages=rollout_data.advantages,
-                    option_advantages=rollout_data.option_advantages,
-                    option_start_advantages=rollout_data.option_start_advantages,
-                    returns=rollout_data.returns,
-                    old_log_probs=rollout_data.old_log_probs,
-                    old_option_log_probs=rollout_data.old_option_log_probs,
-                    old_option_start_log_probs=rollout_data.old_option_start_log_probs,
-                    clip_range=clip_range,
-                    ent_coef=self.ent_coef,
-                    vf_coef=self.vf_coef,
-                    normalize_advantage=self.normalize_advantage,
-                )
-
-        self._n_updates += self.n_epochs
-        explained_var = explained_variance(
-            jnp.concatenate(self.rollout_buffer.option_values).flatten(),  # type: ignore[attr-defined]
-            jnp.concatenate(self.rollout_buffer.returns).flatten(),  # type: ignore[attr-defined]
-        )
-
-        # Logs
-        # self.logger.record("train/entropy_loss", np.mean(entropy_losses))
-        # self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
-        # TODO: use mean instead of one point
-        self.logger.record("train/value_loss", vf_loss_value.item())
-        # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
-        # self.logger.record("train/clip_fraction", np.mean(clip_fractions))
-        self.logger.record("train/pg_loss", pg_loss_value.item())
-        self.logger.record("train/explained_variance", explained_var)
-        # if hasattr(self.policy, "log_std"):
-        #     self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
-
-        self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
-        self.logger.record("train/clip_range", clip_range)
-        # if self.clip_range_vf is not None:
-        #     self.logger.record("train/clip_range_vf", clip_range_vf)

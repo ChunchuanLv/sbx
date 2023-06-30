@@ -8,6 +8,7 @@ from gymnax.environments.environment import Environment, EnvParams
 from copy import deepcopy
 import chex
 import jax
+import jax.numpy as jnp
 class GymnaxToGymWrapper(gym.Env):
     def __init__(
         self,
@@ -169,7 +170,7 @@ class GymnaxToVectorGymWrapper(gym.vector.VectorEnv):
         o, self.env_state = self._env.reset(reset_key, self.env_params)
         return o
 
-    def step(self, action: ActType) -> Tuple[ObsType, float, bool,  dict]:
+    def step(self, action: ActType) -> Tuple[ObsType, jnp.ndarray,  jnp.ndarray,  dict]:
         """Step environment, follow new step API"""
         self.rng, step_key = self._batched_rng_split(self.rng)
         obs, self.env_state, reward, done, info = self._env.step(

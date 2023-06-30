@@ -14,7 +14,7 @@ from sbx.common.type_aliases import (
     ReplayBufferSamples,
     RolloutBufferSamples,
     HierarchicalRolloutBufferSamples,
-    EmpowermentHierarchicalRolloutBufferSamples
+    UnsupervisedHierarchicalRolloutBufferSamples
 )
 from stable_baselines3.common.utils import get_device
 from stable_baselines3.common.vec_env import VecNormalize
@@ -43,7 +43,6 @@ class BaseBuffer(ABC):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
         n_envs: int = 1,
     ):
         super().__init__()
@@ -55,7 +54,6 @@ class BaseBuffer(ABC):
         self.action_dim = get_action_dim(action_space)
         self.pos = 0
         self.full = False
-        self.device = get_device(device)
         self.n_envs = n_envs
 
     @staticmethod
@@ -78,7 +76,7 @@ class BaseBuffer(ABC):
             arr = jnp.concatenate(arr, axis=0)
 
     @staticmethod
-    def flatten(arr: Union[jnp.ndarray,List[jnp.ndarray]]) -> jnp.ndarray:
+    def flatten(arr: Union[jnp.ndarray,List[jnp.ndarray]],keep_env_dims=False) -> jnp.ndarray:
         """
         Swap and then flatten axes 0 (buffer_size) and 1 (n_envs)
         to convert shape from [n_steps, n_envs, ...] (when ... is the shape of the features)
@@ -93,8 +91,10 @@ class BaseBuffer(ABC):
                 shape = (*shape, 1)
 
             return arr.reshape(shape[0] * shape[1], *shape[2:])
-        else:
+        elif not keep_env_dims:
             return jnp.concatenate(arr, axis=0)
+        else:
+            return jnp.stack(arr, axis=0)
     def size(self) -> int:
         """
         :return: The current size of the buffer
@@ -132,8 +132,8 @@ class BaseBuffer(ABC):
         :return:
         """
         upper_bound = self.buffer_size if self.full else self.pos
-        batch_inds = jnp.random.randint(key,(batch_size),0, upper_bound)
-        return self._get_samples(batch_inds, env=env)
+        batch_inds = jax.random.randint(key,(batch_size,),0, upper_bound)
+        return self._get_samples( key, batch_inds, env=env)
 
     @abstractmethod
     def _get_samples(
@@ -188,12 +188,11 @@ class ReplayBuffer(BaseBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
         n_envs: int = 1,
         optimize_memory_usage: bool = False,
         handle_timeout_termination: bool = False,
     ):
-        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+        super().__init__(buffer_size, observation_space, action_space,  n_envs=n_envs)
 
         # Adjust buffer size
         self.buffer_size = max(buffer_size // n_envs, 1)
@@ -211,28 +210,29 @@ class ReplayBuffer(BaseBuffer):
             )
         self.optimize_memory_usage = optimize_memory_usage
 
-        self.observations = jnp.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=observation_space.dtype)
+        self.observations = [jnp.zeros(( self.n_envs, *self.obs_shape), dtype=observation_space.dtype)]*self.buffer_size
 
         if optimize_memory_usage:
             # `observations` contains also the next observation
             self.next_observations = None
         else:
-            self.next_observations = jnp.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=observation_space.dtype)
+            self.next_observations = [jnp.zeros((self.n_envs, *self.obs_shape), dtype=observation_space.dtype)] *self.buffer_size
 
-        self.actions = jnp.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=action_space.dtype)
+        self.actions = [jnp.zeros(( self.n_envs, self.action_dim), dtype=action_space.dtype)]*self.buffer_size
 
-        self.rewards = jnp.zeros((self.buffer_size, self.n_envs), dtype=jnp.float32)
-        self.dones = jnp.zeros((self.buffer_size, self.n_envs), dtype=jnp.float32)
+        self.rewards = [ jnp.zeros(( self.n_envs), dtype=jnp.float32) ]*self.buffer_size
+        self.dones = [ jnp.zeros(( self.n_envs), dtype=jnp.float32)]*self.buffer_size
         # Handle timeouts termination properly if needed
         # see https://github.com/DLR-RM/stable-baselines3/issues/284
         self.handle_timeout_termination = handle_timeout_termination
-        self.timeouts = jnp.zeros((self.buffer_size, self.n_envs), dtype=jnp.float32)
+        self.timeouts = [jnp.zeros((self.n_envs), dtype=jnp.float32)] * self.buffer_size
 
         if psutil is not None:
-            total_memory_usage = self.observations.nbytes + self.actions.nbytes + self.rewards.nbytes + self.dones.nbytes
+            total_memory_usage = self.observations[0].nbytes + self.actions[0].nbytes + self.rewards[0].nbytes + self.dones[0].nbytes
+            total_memory_usage *= self.buffer_size
 
             if self.next_observations is not None:
-                total_memory_usage += self.next_observations.nbytes
+                total_memory_usage += self.next_observations[0].nbytes * self.buffer_size
 
             if total_memory_usage > mem_available:
                 # Convert to GB
@@ -293,38 +293,47 @@ class ReplayBuffer(BaseBuffer):
             to normalize the observations/rewards when sampling
         :return:
         """
-        if not self.optimize_memory_usage:
-            return super().sample(key,batch_size=batch_size, env=env)
+    #    if not self.optimize_memory_usage:
+    #        return super().sample(key=key,batch_size=batch_size, env=env)
         # Do not sample the element with index `self.pos` as the transitions is invalid
         # (we use only one array to store `obs` and `next_obs`)
         if self.full:
-            batch_inds = (jnp.random.randint(key,(batch_size),1, self.buffer_size) + self.pos) % self.buffer_size
+            batch_inds = (jax.random.randint(key,(batch_size,),1, self.buffer_size) + self.pos) % self.buffer_size
         else:
-            batch_inds = jnp.random.randint(key,(batch_size),0, self.pos)
-        return self._get_samples(batch_inds, env=env)
+            batch_inds = jax.random.randint(key,(batch_size,),0, self.pos)
+        return self._get_samples(key=key,batch_inds=batch_inds, env=env)
 
-    def _get_samples(self, batch_inds: jnp.ndarray, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
+    def _get_samples(self, key, batch_inds: jnp.ndarray, env: Optional[VecNormalize] = None) -> ReplayBufferSamples:
         # Sample randomly the env idx
-        env_indices = jnp.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
+     #   env_indices = jnp.random.randint(key=self.noi,0, high=self.n_envs, size=(len(batch_inds),))
+        env_indices = jax.random.randint(key=key, shape=(len(batch_inds),), minval=0, maxval=self.n_envs)
 
+        def indexing(data_list, batch_inds=batch_inds):
+            return [data_list[i] for i in batch_inds]
+        observations = BaseBuffer.flatten(indexing(self.observations),keep_env_dims=True)
+        a = jnp.arange(len(batch_inds))
+    #    print ("batch_inds",batch_inds.shape)
         if self.optimize_memory_usage:
-            next_obs = self._normalize_obs(self.observations[(batch_inds + 1) % self.buffer_size, env_indices, :], env)
+            next_obs = BaseBuffer.flatten(indexing(self.observations, (batch_inds + 1) % self.buffer_size),keep_env_dims=True)
+            next_obs = self._normalize_obs(next_obs[a, env_indices, :], env)
         else:
-            next_obs = self._normalize_obs(self.next_observations[batch_inds, env_indices, :], env)
+            next_obs = BaseBuffer.flatten(indexing(self.next_observations),keep_env_dims=True)
+            next_obs = self._normalize_obs(next_obs[a, env_indices, :], env)
 
-        data = (
-            self._normalize_obs(self.observations[batch_inds, env_indices, :], env),
-            self.actions[batch_inds, env_indices, :],
+        data = ReplayBufferSamples(
+            self._normalize_obs(observations[a, env_indices, :], env),
+            BaseBuffer.flatten(indexing(self.actions),True)[a, env_indices, :],
             next_obs,
             # Only use dones that are not due to timeouts
             # deactivated by default (timeouts is initialized as an array of False)
-            (self.dones[batch_inds, env_indices] * (1 - self.timeouts[batch_inds, env_indices])).reshape(-1, 1),
-            self._normalize_reward(self.rewards[batch_inds, env_indices].reshape(-1, 1), env),
+            (BaseBuffer.flatten(indexing(self.dones),True)[a, env_indices] * (1 - BaseBuffer.flatten(indexing(self.timeouts),True)[a, env_indices])).reshape(-1, 1),
+            self._normalize_reward(BaseBuffer.flatten(indexing(self.rewards),True)[a, env_indices].reshape(-1, 1), env),
         )
-        return ReplayBufferSamples(*tuple(map(self.to_torch, data)))
+       # assert False
+        return data
 
 
-class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
+class UnsupervisedHierarchicalRolloutBuffer(BaseBuffer):
     """
     Rollout buffer used in on-policy algorithms like A2C/PPO.
     It corresponds to ``buffer_size`` transitions collected
@@ -360,25 +369,31 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
     option_starts:  List[jnp.ndarray]
     option_start_advantages:  List[jnp.ndarray]
     option_values:  List[jnp.ndarray]
+    last_option_values:  List[jnp.ndarray]
     option_advantages:  List[jnp.ndarray]
     total_values:  List[jnp.ndarray]
 
-    variational_posterior :  List[jnp.ndarray]
+    variational_log_posterior :  List[jnp.ndarray]
     entropy:  List[jnp.ndarray]
     option_start_time :  List[jnp.ndarray]
     control_values: List[jnp.ndarray]
+    last_option_control_values: List[jnp.ndarray]
+    option_rewards: List[jnp.ndarray]
+    option_reward_values: List[jnp.ndarray]
+    option_returns: List[jnp.ndarray]
+    control_returns: List[jnp.ndarray]
+    returns: List[jnp.ndarray]
     def __init__(
         self,
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
         n_options: int,
-        device: Union[th.device, str] = "auto",
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
     ):
-        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+        super().__init__(buffer_size, observation_space, action_space, n_envs=n_envs)
         self.n_options = n_options
         self.gae_lambda = gae_lambda
         self.gamma = gamma
@@ -390,13 +405,13 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
         self.observations = [jnp.zeros(( self.n_envs, *self.obs_shape), dtype=jnp.float32) ] * self.buffer_size
         self.actions = [jnp.zeros(( self.n_envs, self.action_dim), dtype=jnp.float32)] * self.buffer_size
         self.rewards = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
-        self.returns = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.episode_starts = [jnp.zeros(( self.n_envs), dtype=bool)] * self.buffer_size
         self.values = [jnp.zeros((self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.log_probs = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.advantages = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
 
         self.option_returns = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.option_rewards = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.option_advantages = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.option_start_advantages = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
 
@@ -405,19 +420,24 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
         self.option_start_log_probs = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.option_log_probs = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.option_values = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.last_option_values = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.option_reward_values = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.total_values = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
 
 
-        self.variational_posterior = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.variational_log_posterior = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.control_values = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.last_option_control_values = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.control_returns = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
+        self.returns = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.entropy = [jnp.zeros(( self.n_envs), dtype=jnp.float32)] * self.buffer_size
         self.option_start_time = [jnp.zeros(( self.n_envs), dtype=jnp.int32)] * self.buffer_size
         self.generator_ready = False
 
-    def compute_returns_and_advantage(self, last_values: jnp.ndarray,last_option_values:jnp.ndarray,
-                                      last_control_values:jnp.ndarray, last_entropy,last_variational_posterior,
-                                      last_option_start_time:jnp.ndarray,
-                                      last_option_start_log_prob:jnp.ndarray, dones: jnp.ndarray) -> None:
+    def compute_returns_and_advantage(self, last_values: jnp.ndarray, last_option_values: jnp.ndarray,
+                                      last_control_value:jnp.ndarray, last_variational_log_posterior,
+                                      last_option_start_probs,dones: jnp.ndarray,
+                                      intri_coeffecient=1.0) -> None:
         """
         Post-processing step: compute the lambda-return (TD(lambda) estimate)
         and GAE(lambda) advantage.
@@ -437,58 +457,133 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
         :param dones: if the last step was a terminal step (one bool for each env).
         """
         # Convert to numpy
-        last_values = last_values.flatten()
-        last_option_values = last_option_values.flatten()
-        last_option_starts_probability = jnp.exp(last_option_start_log_prob.flatten())
 
-        last_gae_lam = 0
-
-        last_value_adjusted = (last_values + self.gamma**(last_option_start_time-self.buffer_size) * last_variational_posterior)
-        last_option_value_adjusted = last_option_values- last_entropy-last_control_values * ( 1- self.gamma**(last_option_start_time-self.buffer_size) )
-        self.total_values[self.pos] =last_value_adjusted * last_option_starts_probability + last_option_value_adjusted* (1-last_option_starts_probability)
-
-        last_total_value = last_values * last_option_starts_probability + last_option_values * (1-last_option_starts_probability)
-        gae_lambda_multiplier = (1 - self.gae_lambda ) / (1 - self.gae_lambda ** self.buffer_size)
         gamme_lambda = self.gamma * self.gae_lambda
-        generalized_reward = 0
-        generalized_value = 0
+
+
+        generalized_option_reward = 0
+        generalized_new_value = 0
+        generalized_total_reward = 0
+        next_control_value = 0
+        last_gae_lam = 0
         for step in reversed(range(self.buffer_size)):
             if step == self.buffer_size - 1:
                 next_non_terminal = 1.0 - dones
-                next_total_value = last_total_value 
+                next_option_non_terminal = 1.0 - last_option_start_probs
+                next_value = last_values
+                next_option_values = last_option_values
+                next_option_start_probs = last_option_start_probs
+                next_variational_log_posterior = last_variational_log_posterior
+                next_control_value = last_control_value
+                episode_end_times = self.buffer_size
+                option_end_times = self.buffer_size
+
+                # the undiscounted control_reward of the current option
+                control_rewards = next_option_start_probs * next_variational_log_posterior+(1-next_option_start_probs) * next_control_value
             else:
                 next_non_terminal = 1.0 - self.episode_starts[step + 1]
-                next_total_value = self.total_values[step + 1]
+                next_option_non_terminal = 1.0 - self.option_starts[step + 1]
+                next_value = self.values[step + 1]
+                next_option_values = self.option_values[step + 1]
 
-            generalized_value = generalized_value * gamme_lambda + self.gamma * next_total_value * next_non_terminal / gae_lambda_multiplier
-            generalized_reward = generalized_reward * gamme_lambda + self.rewards[step] / gae_lambda_multiplier
-            generalized_returns = gae_lambda_multiplier * (generalized_reward + generalized_value)
-            
-            self.option_advantages[step] = generalized_returns - self.values[step]
-            self.option_start_advantages[step] = generalized_returns - self.values[step] 
-            self.advantages[step] = generalized_returns - self.option_values[step]
-            
+                #self.variational_log_posterior[t+1] is loq q(o_{t}|s_{t+1})
+                next_option_start_probs = jnp.exp(self.option_start_log_probs[step+1])
+
+            #    next_control_value = jnp.where(self.option_starts[step+1], self.variational_log_posterior[step+1], self.control_values[step+1])
+                next_control_value = self.control_values[step+1]
+                next_variational_log_posterior = self.variational_log_posterior[step+1]
+                episode_end_times = jnp.where(self.episode_starts[step+1], step+1, episode_end_times)
+                option_end_times = jnp.where(self.option_starts[step+1], step+1, option_end_times)
+
+                # the undiscounted control_reward of the current option
+                control_rewards = jnp.where(next_option_non_terminal, control_rewards, next_variational_log_posterior)
+
+            next_total_value = next_option_start_probs * next_value \
+                               + (1-next_option_start_probs) * (next_option_values - next_control_value ) \
+                               + self.gamma ** (self.option_start_time[step]-step-1) * next_control_value
+            episode_gae_lambda_multiplier = (1 - self.gae_lambda) / (1 - self.gae_lambda ** (episode_end_times - step))
+            option_gae_lambda_multiplier = (1 - self.gae_lambda) / (1 - self.gae_lambda ** (option_end_times - step))
+
+            generalized_option_reward = generalized_option_reward * gamme_lambda * next_option_non_terminal + self.rewards[step] / option_gae_lambda_multiplier
+
+
+
+
+            weighted_variational_log_posterior = self.gamma ** (self.option_start_time[step]-step) * self.variational_log_posterior[step] * (1-self.episode_starts[step])
+            intrinsic_reward = self.entropy[step]+ weighted_variational_log_posterior
+            total_rewards = self.rewards[step] + intri_coeffecient*self.option_starts[step] * intrinsic_reward
+            generalized_total_reward = generalized_total_reward * gamme_lambda * next_non_terminal + total_rewards / episode_gae_lambda_multiplier
+            generalized_new_value = generalized_new_value * gamme_lambda * next_non_terminal + self.gamma * next_total_value
+
+            #estimated return from the current state, including  control value and new entropy gain
+            returns = episode_gae_lambda_multiplier * (generalized_total_reward + generalized_new_value) #- weighted_variational_log_posterior
+
+
+       #     option_start_probs = jnp.exp(self.option_start_log_probs[step])
+        #    weighted_control_values = self.gamma ** (self.option_start_time[step]-step) * self.control_values[step]
+
+        #    last_option_start_time = self.option_start_time[step-1] if step > 0 else -1
+        #    adjusted_last_option_control_values = (self.gamma ** (step-1-last_option_start_time)-1) * self.last_option_control_values[step]
+       #     expected_total_value = option_start_probs * (self.values[step] + intri_coeffecient* weighted_control_values)\
+       #                            + (1-option_start_probs) * (self.last_option_values[step] + intri_coeffecient * adjusted_last_option_control_values )
+            #need to mask with not episode_starts
+        #    self.option_start_advantages[step] = returns - expected_total_value
+            self.option_start_advantages[step] = control_rewards - self.control_values[step]
+
+
+     #       weighted_control_rewards = self.gamma ** (self.option_start_time[step]-step) * control_rewards
+     #       controlled_option_rewards = option_gae_lambda_multiplier * generalized_option_reward + intri_coeffecient* weighted_control_rewards
+     #       controlled_option_baseline = self.option_reward_values[step] + intri_coeffecient* weighted_control_values
+     #       self.advantages[step] = controlled_option_rewards - controlled_option_baseline #generalized_returns - self.option_values[step]
         # TD(lambda) estimator, see Github PR #375 or "Telescoping in TD(lambda)"
         # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
-            self.returns[step] = generalized_returns
 
+            #match self.option_values[step]
+            # option rewards + expected discounted value of the terminal states, and control rewards  of the current option
+            #the control rewards is adjusted to the true starting time of the option, so we need to readjust it
+            option_returns = returns - intri_coeffecient * self.option_starts[step] * intrinsic_reward +\
+                              intri_coeffecient * (1 - self.gamma ** (step- self.option_start_time[step]) ) * control_rewards
+
+            self.option_returns[step] = option_returns# Sampled Q(s_t,z_t)
+
+            #   generalized_returns include current
+            #  assume a new option starts,  when a specific option is selected what's the advantage?
+            # if it started, the new advantage is independent of the control value from the old option
+            # if it didn't start, we share gain entropy
+            self.option_advantages[step] = self.option_returns[step] + intri_coeffecient * self.entropy[step] - self.values[step]
+            self.advantages[step] = returns - intri_coeffecient * self.option_starts[step] * intrinsic_reward \
+                                    - (self.option_values[step] +  intri_coeffecient * ( self.gamma ** (self.option_start_time[step] - step) -1) * self.control_values[step])
+            #match self.values[step]
+            # value function of state = entropy + expected option returns
+            self.returns[step] = self.option_returns[step] + intri_coeffecient * self.entropy[step]  # Sampled V(s_t)
+
+            #match self.control_values[step]
+            #target value of E_{(o_t,s_t)}[log q(o_t|s_\tau)] if get value in the next time step.
+            self.control_returns[step] = control_rewards
+
+            #match self.option_reward_values[step]
+            #target value of E_{(o_t,s_t)}[\sum_i \gamma^î r_i ]
+            self.option_rewards[step] = option_gae_lambda_multiplier * generalized_option_reward # Sampled C(s_t,z_t)
     def add(
         self,
         obs: jnp.ndarray,
         action: jnp.ndarray,
-        reward: jnp.ndarray,
+        extrin_reward: jnp.ndarray,
         episode_start: jnp.ndarray,
         value: jnp.ndarray,
         option:jnp.ndarray,
         option_start:jnp.ndarray,
         option_value:jnp.ndarray,
+            last_option_value:jnp.ndarray,
         log_prob: jnp.ndarray,
         option_log_prob: jnp.ndarray,
         option_start_log_prob: jnp.ndarray,
-        variational_posterior: jnp.ndarray,
-        control_values: jnp.ndarray,
+        variational_log_posterior: jnp.ndarray,
         entropy: jnp.ndarray,
+        control_value: jnp.ndarray,
+            last_option_control_value: jnp.ndarray,
         option_start_time:jnp.ndarray,
+        option_reward_value:jnp.ndarray,
     ) -> None:
         """
         :param obs: Observation
@@ -499,7 +594,7 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
             following the current policy.
         :param log_prob: log probability of the action
             following the current policy.
-        :param variational_posterior: variational_posterior of the current state
+        :param variational_log_posterior: variational_log_posterior of the current state
         """
         if len(log_prob.shape) == 0:
             # Reshape 0-d tensor to avoid error
@@ -511,26 +606,22 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
             obs = obs.reshape((self.n_envs, *self.obs_shape))
 
         # Reshape to handle multi-dim and discrete action spaces, see GH #970 #1392
-        action = action.reshape((self.n_envs, self.action_dim))
-        option_value = option_value.flatten()
-        value = value.flatten()
-        variational_posterior = variational_posterior * (1-episode_start)
         self.observations[self.pos] = obs
         self.actions[self.pos] = action
-        self.rewards[self.pos] = reward+option_start* (entropy+self.gamma**(option_start_time-self.pos) * variational_posterior)
+        self.rewards[self.pos] = extrin_reward
         self.episode_starts[self.pos] = episode_start
         self.values[self.pos] = value
         self.options[self.pos] = option
         self.option_values[self.pos] = option_value
+        self.last_option_values[self.pos] = last_option_value
         self.option_starts[self.pos] = option_start
-        option_start_prob = jnp.exp(option_start_log_prob.flatten())
-        value_adjusted = (value + self.gamma**(option_start_time-self.pos) * variational_posterior)
-        option_value_adjusted = option_value- entropy-control_values * ( 1- self.gamma**(option_start_time-self.pos) )
-        self.total_values[self.pos] =value_adjusted * option_start_prob + option_value_adjusted* (1-option_start_prob)
         self.log_probs[self.pos] = log_prob
         self.option_start_log_probs[self.pos] = option_start_log_prob
         self.option_log_probs[self.pos] = option_log_prob #* option_start_prob + option_start_log_prob * (1-option_start_prob)
-        self.variational_posterior[self.pos] = variational_posterior
+        self.option_reward_values[self.pos] = option_reward_value #* option_start_prob + option_start_log_prob * (1-option_start_prob)
+        self.variational_log_posterior[self.pos] = variational_log_posterior
+        self.control_values[self.pos] = control_value
+        self.last_option_control_values[self.pos] = last_option_control_value
         self.entropy[self.pos] = entropy
         self.option_start_time[self.pos] = option_start_time
         self.pos += 1
@@ -554,10 +645,12 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
             "option_advantages",
             "option_start_advantages",
             "returns",
-            "variational_posterior"
-            "control_values",
+            "variational_log_posterior",
+            "control_returns",
             "option_start_time",
-            "entropy"
+            "entropy",
+            "option_rewards",
+            "option_returns",
         ]
         samples = {}
         for tensor in _tensor_names:
@@ -571,13 +664,20 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
         while start_idx < self.buffer_size * self.n_envs:
             yield self._get_samples(indices[start_idx : start_idx + batch_size],samples)
             start_idx += batch_size
-
+    def conditioned_mean(self,values : Union[str,List[jnp.ndarray]],conditions: Union[str,List[jnp.ndarray]] = "option_starts")->float:
+        if isinstance(values,str):
+            values = self.__dict__[values]
+        values = jnp.concatenate(values)
+        if isinstance(conditions,str):
+            conditions = self.__dict__[conditions]
+        conditions = jnp.concatenate(conditions)
+        return jnp.sum(values*conditions)/jnp.sum(conditions).item()
     def _get_samples(
         self,
         batch_inds: jnp.ndarray,
         samples: Dict[str, jnp.ndarray],
         env: Optional[VecNormalize] = None,
-    ) -> EmpowermentHierarchicalRolloutBufferSamples:  # type: ignore[signature-mismatch] #FIXME
+    ) -> UnsupervisedHierarchicalRolloutBufferSamples:  # type: ignore[signature-mismatch] #FIXME
         data = (
             samples["observations"][batch_inds],
             samples["actions"][batch_inds],
@@ -592,16 +692,18 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
             samples["option_advantages"][batch_inds].flatten(),
             samples["option_start_advantages"][batch_inds].flatten(),
             samples["returns"][batch_inds].flatten(),
-            samples["variational_posterior"][batch_inds].flatten(),
-            samples["control_values"][batch_inds].flatten(),
+            samples["variational_log_posterior"][batch_inds].flatten(),
+            samples["control_returns"][batch_inds].flatten(),
             samples["option_start_time"][batch_inds].flatten(),
             samples["entropy"][batch_inds].flatten(),
+            samples["option_rewards"][batch_inds].flatten(),
+            samples["option_returns"][batch_inds].flatten(),
         )
      #   print ("data.options",data.options)
    #     print ("data.last_options",data.last_options)
-        return EmpowermentHierarchicalRolloutBufferSamples(*data)
+        return UnsupervisedHierarchicalRolloutBufferSamples(*data)
 
-    class HierarchicalRolloutBuffer(BaseBuffer):
+class HierarchicalRolloutBuffer(BaseBuffer):
         """
         Rollout buffer used in on-policy algorithms like A2C/PPO.
         It corresponds to ``buffer_size`` transitions collected
@@ -617,7 +719,6 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
         :param buffer_size: Max number of element in the buffer
         :param observation_space: Observation space
         :param action_space: Action space
-        :param device: PyTorch device
         :param gae_lambda: Factor for trade-off of bias vs variance for Generalized Advantage Estimator
             Equivalent to classic advantage when set to 1.
         :param gamma: Discount factor
@@ -646,12 +747,11 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
                 observation_space: spaces.Space,
                 action_space: spaces.Space,
                 n_options: int,
-                device: Union[th.device, str] = "auto",
                 gae_lambda: float = 1,
                 gamma: float = 0.99,
                 n_envs: int = 1,
         ):
-            super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+            super().__init__(buffer_size, observation_space, action_space,  n_envs=n_envs)
             self.n_options = n_options
             self.gae_lambda = gae_lambda
             self.gamma = gamma
@@ -681,8 +781,7 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
             self.total_values = [jnp.zeros((self.n_envs), dtype=jnp.float32)] * self.buffer_size
             self.generator_ready = False
 
-        def compute_returns_and_advantage(self, last_values: jnp.ndarray, last_option_values: jnp.ndarray,
-                                          last_option_start_log_prob: jnp.ndarray, dones: jnp.ndarray) -> None:
+        def compute_returns_and_advantage(self, last_total_value: jnp.ndarray, dones: jnp.ndarray) -> None:
             """
             Post-processing step: compute the lambda-return (TD(lambda) estimate)
             and GAE(lambda) advantage.
@@ -702,19 +801,11 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
             :param dones: if the last step was a terminal step (one bool for each env).
             """
             # Convert to numpy
-            last_values = last_values.flatten()
-            last_option_values = last_option_values.flatten()
-            last_option_starts_probability = jnp.exp(last_option_start_log_prob.flatten())
-
-            last_gae_lam = 0
-
-            last_total_value = last_values * last_option_starts_probability + last_option_values * (
-                        1 - last_option_starts_probability)
-            gae_lambda_multiplier = (1 - self.gae_lambda) / (1 - self.gae_lambda ** self.buffer_size)
             gamme_lambda = self.gamma * self.gae_lambda
             generalized_reward = 0
             generalized_value = 0
             for step in reversed(range(self.buffer_size)):
+                gae_lambda_multiplier = (1 - self.gae_lambda) / (1 - self.gae_lambda ** (self.buffer_size - step))
                 if step == self.buffer_size - 1:
                     next_non_terminal = 1.0 - dones
                     next_total_value = last_total_value
@@ -722,12 +813,12 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
                     next_non_terminal = 1.0 - self.episode_starts[step + 1]
                     next_total_value = self.total_values[step + 1]
 
-                generalized_value = generalized_value * gamme_lambda + self.gamma * next_total_value * next_non_terminal / gae_lambda_multiplier
-                generalized_reward = generalized_reward * gamme_lambda + self.rewards[step] / gae_lambda_multiplier
+                generalized_value = (generalized_value * gamme_lambda + self.gamma * next_total_value )* next_non_terminal #/ gae_lambda_multiplier
+                generalized_reward = generalized_reward * gamme_lambda * next_non_terminal + self.rewards[step] / gae_lambda_multiplier
                 generalized_returns = gae_lambda_multiplier * (generalized_reward + generalized_value)
 
                 self.option_advantages[step] = generalized_returns - self.values[step]
-                self.option_start_advantages[step] = generalized_returns - self.values[step]
+                self.option_start_advantages[step] = generalized_returns - self.total_values[step]
                 self.advantages[step] = generalized_returns - self.option_values[step]
 
                 # TD(lambda) estimator, see Github PR #375 or "Telescoping in TD(lambda)"
@@ -842,8 +933,6 @@ class EmpowermentHierarchicalRolloutBuffer(BaseBuffer):
                 samples["returns"][batch_inds].flatten(),
             )
             data = HierarchicalRolloutBufferSamples(*data)
-            #   print ("data.options",data.options)
-            #     print ("data.last_options",data.last_options)
             return HierarchicalRolloutBufferSamples(*data)
 class RolloutBuffer(BaseBuffer):
     """
@@ -882,12 +971,11 @@ class RolloutBuffer(BaseBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
-        device: Union[th.device, str] = "auto",
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
     ):
-        super().__init__(buffer_size, observation_space, action_space, device, n_envs=n_envs)
+        super().__init__(buffer_size, observation_space, action_space,  n_envs=n_envs)
         self.gae_lambda = gae_lambda
         self.gamma = gamma
         self.generator_ready = False
@@ -1159,11 +1247,12 @@ class DictReplayBuffer(ReplayBuffer):
 
     def _get_samples(
         self,
+            key,
         batch_inds: jnp.ndarray,
         env: Optional[VecNormalize] = None,
     ) -> DictReplayBufferSamples:  # type: ignore[signature-mismatch] #FIXME:
         # Sample randomly the env idx
-        env_indices = jnp.random.randint(0, high=self.n_envs, size=(len(batch_inds),))
+        env_indices = jax.random.randint(key,minval=0, maxval=self.n_envs, shape=(len(batch_inds),))
 
         # Normalize if needed and remove extra dimension (we are using only one env for now)
         obs_ = self._normalize_obs({key: obs[batch_inds, env_indices, :] for key, obs in self.observations.items()}, env)

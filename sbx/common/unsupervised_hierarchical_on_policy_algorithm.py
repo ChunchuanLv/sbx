@@ -6,83 +6,23 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from gymnasium import spaces
-from sbx.common.buffers import HierarchicalRolloutBuffer
+from sbx.common.buffers import UnsupervisedHierarchicalRolloutBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 
 from sbx.common.utils import safe_mean
 from sbx.common.policies import BasePolicy
-from sbx.common.base_class import BaseAlgorithmJax
-from sbx.common.policies import HierarchicalBaseJaxPolicy
+from sbx.common.hierarchical_on_policy_algorithm import HierarchicalOnPolicyAlgorithmJax
+from sbx.common.policies import UnsupervisedHierarchicalBaseJaxPolicy
 
 from sbx.common.type_aliases import GymEnv, Schedule, MaybeCallback
 from sbx.common.gymanax_wrapper import GymnaxToVectorGymWrapper as VecEnv
-OnPolicyAlgorithmJaxSelf = TypeVar("HierarchicalOnPolicyAlgorithmJaxSelf", bound="HierarchicalOnPolicyAlgorithmJax")
+UnsupervisedHierarchicalOnPolicyAlgorithmJaxSelf = TypeVar("UnsupervisedHierarchicalOnPolicyAlgorithmJaxSelf", bound="UnsupervisedHierarchicalOnPolicyAlgorithmJax")
 
 
-from sbx.common import utils
-from collections import deque
-class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
-    rollout_buffer: HierarchicalRolloutBuffer
-    policy: HierarchicalBaseJaxPolicy  # type: ignore[assignment]
-
-    def _setup_learn(
-        self,
-        total_timesteps: int,
-        callback: MaybeCallback = None,
-        reset_num_timesteps: bool = True,
-        tb_log_name: str = "run",
-        progress_bar: bool = False,
-    ) -> Tuple[int, BaseCallback]:
-        """
-        Initialize different variables needed for training.
-
-        :param total_timesteps: The total number of samples (env steps) to train on
-        :param callback: Callback(s) called at every step with state of the algorithm.
-        :param reset_num_timesteps: Whether to reset or not the ``num_timesteps`` attribute
-        :param tb_log_name: the name of the run for tensorboard log
-        :param progress_bar: Display a progress bar using tqdm and rich.
-        :return: Total timesteps and callback(s)
-        """
-        self.start_time = time.time_ns()
-
-        if self.ep_info_buffer is None or reset_num_timesteps:
-            # Initialize buffers if they don't exist, or reinitialize if resetting counters
-            self.ep_info_buffer = deque(maxlen=self._stats_window_size)
-            self.ep_success_buffer = deque(maxlen=self._stats_window_size)
-
-        if self.action_noise is not None:
-            self.action_noise.reset()
-
-        if reset_num_timesteps:
-            self.num_timesteps = 0
-            self._episode_num = 0
-        else:
-            # Make sure training timesteps are ahead of the internal counter
-            total_timesteps += self.num_timesteps
-        self._total_timesteps = total_timesteps
-        self._num_timesteps_at_start = self.num_timesteps
-
-        # Avoid resetting the environment when calling ``.learn()`` consecutive times
-        if reset_num_timesteps or self._last_obs is None:
-            assert self.env is not None
-            # pytype: disable=annotation-type-mismatch
-            self._last_obs = self.env.reset()  # type: ignore[assignment]
-            # pytype: enable=annotation-type-mismatch
-            self._last_episode_starts = jnp.ones((self.env.num_envs,), dtype=bool)
-            self._last_option_starts = jnp.ones((self.env.num_envs,), dtype=bool)
-            self._last_options = jnp.zeros((self.env.num_envs,), dtype=int)
-            # Retrieve unnormalized observation for saving into the buffer
-            if self._vec_normalize_env is not None:
-                self._last_original_obs = self._vec_normalize_env.get_original_obs()
-
-        # Configure logger's outputs if no logger was passed
-        if not self._custom_logger:
-            self._logger = utils.configure_logger(self.verbose, self.tensorboard_log, tb_log_name, reset_num_timesteps)
-
-        # Create eval callback if needed
-        callback = self._init_callback(callback, progress_bar)
-
-        return total_timesteps, callback
+class UnsupervisedHierarchicalOnPolicyAlgorithmJax(HierarchicalOnPolicyAlgorithmJax):
+    rollout_buffer: UnsupervisedHierarchicalRolloutBuffer
+    policy: UnsupervisedHierarchicalBaseJaxPolicy  # type: ignore[assignment]
+    intri_coef:float
     def __init__(
         self,
         policy: Union[str, Type[BasePolicy]],
@@ -120,27 +60,13 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
             verbose=verbose,
             seed=seed,
             supported_action_spaces=supported_action_spaces,
+            n_steps=n_steps,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            ent_coef=ent_coef,
+            vf_coef=vf_coef,
+            max_grad_norm=max_grad_norm,
         )
-        self.n_steps = n_steps
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.ent_coef = ent_coef
-        self.vf_coef = vf_coef
-        self.max_grad_norm = max_grad_norm
-        self.n_options = policy_kwargs["net_arch"]["n_options"]
-        # Will be updated later
-        self.key = jax.random.PRNGKey(0)
-
-        if _init_setup_model:
-            self._setup_model()
-    def _get_torch_save_params(self):
-        return [], []
-
-    def _excluded_save_params(self) -> List[str]:
-        excluded = super()._excluded_save_params()
-        excluded.remove("policy")
-        return excluded
-
     def set_random_seed(self, seed: Optional[int]) -> None:  # type: ignore[override]
         super().set_random_seed(seed)
         if seed is None:
@@ -152,7 +78,7 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
         self._setup_lr_schedule()
         self.set_random_seed(self.seed)
 
-        self.rollout_buffer = HierarchicalRolloutBuffer(
+        self.rollout_buffer = UnsupervisedHierarchicalRolloutBuffer(
             self.n_steps,
             self.observation_space,
             self.action_space,
@@ -166,8 +92,9 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
         self,
         env: VecEnv,
         callback: BaseCallback,
-        rollout_buffer: HierarchicalRolloutBuffer,
+        rollout_buffer: UnsupervisedHierarchicalRolloutBuffer,
         n_rollout_steps: int,
+        unsupervised:bool = True
     ) -> bool:
         """
         Collect experiences using the current policy and fill a ``RolloutBuffer``.
@@ -192,7 +119,10 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
             self.policy.reset_noise()
 
         option_start_log_probs = jnp.zeros((self.env.num_envs,), dtype=float)
+        option_start_time = jnp.zeros((self.env.num_envs,), dtype=int)
+        self._last_episode_starts = jnp.ones((self.env.num_envs,), dtype=bool)
         while n_steps < n_rollout_steps:
+            option_start_time = jnp.where(self._last_option_starts,n_steps * jnp.ones((self.env.num_envs,), dtype=int),option_start_time)
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
                 # Sample a new noise matrix
                 self.policy.reset_noise()
@@ -205,12 +135,10 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
         #    print ("last_options",self._last_options)
         #    print ("last_option_starts",self._last_option_starts)
         #    print ("noise_key", self.policy.noise_key)
-            actions, options,  log_probs, option_log_probs, values, option_values = self.policy.predict_all(obs_jnp,self._last_options,self._last_option_starts,
+            actions, self._last_option_starts, options,  log_probs, option_log_probs, values, option_values,last_option_values,\
+                option_reward_value,  last_option_control_values,control_values,entropy, variational_log_posteriors, option_start_log_probs\
+                = self.policy.predict_all(obs_jnp,self._last_options,self._last_episode_starts,
                                                                  self.policy.noise_key)
-
-         #   actions = jnp.array(actions)
-         #   log_probs = jnp.array(log_probs)
-        #    values = jnp.array(values)
 
             # Rescale and perform action
             # Clip the actions to avoid out of bound error
@@ -218,9 +146,8 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
                 clipped_actions = jnp.clip(actions, self.action_space.low, self.action_space.high)
             else:
                 clipped_actions = actions
-       #     print ("clipped_actions",clipped_actions)
-         #   print ("env_state",env.env_state)
-            new_obs, rewards, dones, infos = env.step(clipped_actions)
+            new_obs, extrin_rewards, dones, infos = env.step(clipped_actions)
+            extrin_rewards = extrin_rewards * (1-self.intri_coef)#jnp.zeros((self.env.num_envs,), dtype=float)
             self.num_timesteps += env.num_envs
 
             # Give access to local variables
@@ -234,43 +161,49 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
                 # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
 
-            # Handle timeout by bootstraping with value function
-            # see GitHub issue #633
-       #     if infos.get("terminal_observation") is not None and infos.get("TimeLimit.truncated", False):
-       #         terminal_obs = self.policy.prepare_obs(infos["terminal_observation"])[0]
-        #        terminal_value = jnp.array(
-         #           self.vf.apply(  # type: ignore[union-attr]
-          #              self.policy.vf_state.params,
-           #             terminal_obs,
-            #        ).flatten()
-             #   )
-              #  rewards += self.gamma * terminal_value
+         #   variational_posterior_probs = jnp.exp(variational_log_posteriors) * (1 - self._last_episode_starts)
+        #    weighted_variational_log_posterior = variational_log_posteriors * self.gamma ** (option_start_time - n_steps)
+       #     weighted_variational_log_posterior = jnp.clip(weighted_variational_log_posterior,-1e2,1e2)
+      #      intrin_reward = self._last_option_starts * ( entropy + weighted_variational_log_posterior * (1 - self._last_episode_starts))
 
             rollout_buffer.add(
                 self._last_obs,  # type: ignore
                 actions,
-                rewards,
+                extrin_rewards,
                 self._last_episode_starts,  # type: ignore
                 values,
                 options,
                 self._last_option_starts,
                 option_values,
+                last_option_values,
                 log_probs,
                 option_log_probs,
-                option_start_log_probs
+                option_start_log_probs,
+                variational_log_posteriors,
+                entropy,
+                control_values,
+                last_option_control_values,
+                option_start_time,
+                option_reward_value,
             )
 
             self._last_obs = new_obs  # type: ignore[assignment]
             self._last_episode_starts = dones
-            self._last_options = options
-            self._last_option_starts, option_start_log_probs = self.policy.option_start(new_obs, options,dones,self.policy.noise_key)
+        self._last_options = options
+        self._last_option_starts, option_start_log_probs = self.policy.option_start(new_obs, options,dones,self.policy.noise_key)
 
-        last_values = self.policy.value_function(new_obs).flatten()
-        last_option_values = self.policy.option_value_function(new_obs, options).flatten()
-        last_option_starts_probability = jnp.exp(option_start_log_probs.flatten())
-        last_total_value = last_values * last_option_starts_probability + last_option_values * (
-                    1 - last_option_starts_probability)
-        rollout_buffer.compute_returns_and_advantage(last_total_value=last_total_value, dones=dones)
+        last_values = self.policy.value_function(new_obs)
+        last_option_values = self.policy.option_value_function(new_obs, options)
+        last_control_values = self.policy.control_value_function(new_obs, options)
+        last_entropy = self.policy.policy_entropy(new_obs)
+        last_variational_log_posterior = self.policy.variational_posterior_log_prob(new_obs, options)
+
+        option_start_probs = jnp.exp(option_start_log_probs)
+        rollout_buffer.compute_returns_and_advantage(last_values=last_values,last_option_values=last_option_values,
+                                                     last_control_value=last_control_values,
+                                                     last_variational_log_posterior=last_variational_log_posterior,
+                                                     last_option_start_probs=option_start_probs,dones=dones,
+                                                     intri_coeffecient=self.intri_coef)
 
         callback.on_rollout_end()
 
@@ -284,14 +217,14 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
         raise NotImplementedError
 
     def learn(
-        self: OnPolicyAlgorithmJaxSelf,
+        self: UnsupervisedHierarchicalOnPolicyAlgorithmJaxSelf ,
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 1,
         tb_log_name: str = "HierarchicalOnPolicyAlgorithmJax",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
-    ) -> OnPolicyAlgorithmJaxSelf:
+    ) -> UnsupervisedHierarchicalOnPolicyAlgorithmJaxSelf:
         iteration = 0
 
         total_timesteps, callback = self._setup_learn(
@@ -334,3 +267,4 @@ class HierarchicalOnPolicyAlgorithmJax(BaseAlgorithmJax):
         callback.on_training_end()
 
         return self
+

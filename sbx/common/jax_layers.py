@@ -6,7 +6,6 @@ import flax.linen as nn
 
 from sbx.common.preprocessing import get_flattened_obs_dim, is_image_space
 from sbx.common.type_aliases import JnpDict
-import numpy as np
 
 class BaseFeaturesExtractor(nn.Module):
     """

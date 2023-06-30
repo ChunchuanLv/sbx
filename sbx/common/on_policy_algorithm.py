@@ -45,7 +45,6 @@ class OnPolicyAlgorithmJax(BaseAlgorithmJax):
         env_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
         seed: Optional[int] = None,
-        device: str = "auto",
         _init_setup_model: bool = True,
         supported_action_spaces: Optional[Tuple[Type[spaces.Space], ...]] = None,
     ):
@@ -101,7 +100,6 @@ class OnPolicyAlgorithmJax(BaseAlgorithmJax):
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
             n_envs=self.n_envs,
-            device="cpu",  # force cpu device to easy torch -> numpy conversion
         )
 
     def collect_rollouts(

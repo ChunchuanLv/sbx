@@ -15,7 +15,7 @@ from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedul
 
 from sbx.common.off_policy_algorithm import OffPolicyAlgorithmJax
 from sbx.common.type_aliases import  RLTrainState,ReplayBufferSamples
-from sbx.sac.policies import SACPolicy
+from sbx.hsac.policies import HSACPolicy
 
 
 class EntropyCoef(nn.Module):
@@ -38,14 +38,14 @@ class ConstantEntropyCoef(nn.Module):
         return self.ent_coef_init
 
 
-class SAC(OffPolicyAlgorithmJax):
-    policy_aliases: Dict[str, Type[SACPolicy]] = {  # type: ignore[assignment]
-        "MlpPolicy": SACPolicy,
+class HSAC(OffPolicyAlgorithmJax):
+    policy_aliases: Dict[str, Type[HSACPolicy]] = {  # type: ignore[assignment]
+        "MlpPolicy": HSACPolicy,
         # Minimal dict support using flatten()
-        "MultiInputPolicy": SACPolicy,
+        "MultiInputPolicy": HSACPolicy,
     }
 
-    policy: SACPolicy
+    policy: HSACPolicy
     action_space: spaces.Box  # type: ignore[assignment]
 
     def __init__(
@@ -58,7 +58,7 @@ class SAC(OffPolicyAlgorithmJax):
         learning_starts: int = 100,
         batch_size: int = 256,
         tau: float = 0.005,
-        gamma: float = 0.99,
+        gamma: float = 0.9,
         train_freq: Union[int, Tuple[int, str]] = 1,
         gradient_steps: int = 1,
         policy_delay: int = 1,
@@ -167,7 +167,7 @@ class SAC(OffPolicyAlgorithmJax):
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 4,
-        tb_log_name: str = "SAC",
+        tb_log_name: str = "HSAC",
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
     ):
@@ -364,7 +364,7 @@ class SAC(OffPolicyAlgorithmJax):
                 qf_state,
                 (qf_loss_value, ent_coef_value),
                 key,
-            ) = SAC.update_critic(
+            ) = HSAC.update_critic(
                 gamma,
                 actor_state,
                 qf_state,
@@ -376,7 +376,7 @@ class SAC(OffPolicyAlgorithmJax):
                 slice(data.dones),
                 key,
             )
-            qf_state = SAC.soft_update(tau, qf_state)
+            qf_state = HSAC.soft_update(tau, qf_state)
 
             # hack to be able to jit (n_updates % policy_delay == 0)
             if i in policy_delay_indices:
@@ -387,7 +387,7 @@ class SAC(OffPolicyAlgorithmJax):
                     slice(data.observations),
                     key,
                 )
-                ent_coef_state, _ = SAC.update_temperature(target_entropy, ent_coef_state, entropy)
+                ent_coef_state, _ = HSAC.update_temperature(target_entropy, ent_coef_state, entropy)
 
         return (
             qf_state,
